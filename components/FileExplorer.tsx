@@ -87,6 +87,13 @@ interface PendingConflict {
   nonReplaceable: string[];
 }
 
+/** One line inside a file, as the content search reports it. */
+interface ContentMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
 async function responseError(res: Response, fallback: string): Promise<Error> {
   let message = `${fallback} (HTTP ${res.status})`;
   try {
@@ -761,6 +768,10 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   const [searchError, setSearchError] = useState(false);
   const [searchExpanded, setSearchExpanded] = useState<Set<string>>(new Set());
   const searchInputRef = useRef<HTMLInputElement>(null);
+  // Matches inside files, beside the path matches above.
+  const [contentMatches, setContentMatches] = useState<ContentMatch[]>([]);
+  const [contentLoading, setContentLoading] = useState(false);
+  const [contentTruncated, setContentTruncated] = useState(false);
   const [fileDragActive, setFileDragActive] = useState(false);
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
   const fileDragDepthRef = useRef(0);
@@ -796,6 +807,39 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
         })
         .finally(() => { if (!controller.signal.aborted) setSearchLoading(false); });
     }, 150);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [cwd, fileSearchOpen, searchQuery]);
+
+  // Content search is the expensive half: it reads files, so it waits for a
+  // longer pause and a query worth looking for.
+  useEffect(() => {
+    if (!fileSearchOpen) return;
+    const query = searchQuery.trim();
+    if (query.length < 2) {
+      setContentMatches([]);
+      setContentLoading(false);
+      setContentTruncated(false);
+      return;
+    }
+    const controller = new AbortController();
+    setContentLoading(true);
+    const timer = setTimeout(() => {
+      fetch(`/api/file-search?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}`, { signal: controller.signal })
+        .then((response) => response.ok
+          ? response.json() as Promise<{ matches?: ContentMatch[]; truncated?: boolean }>
+          : Promise.reject(new Error("Search failed")))
+        .then((data) => {
+          setContentMatches(data.matches ?? []);
+          setContentTruncated(Boolean(data.truncated));
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) {
+            setContentMatches([]);
+            setContentTruncated(false);
+          }
+        })
+        .finally(() => { if (!controller.signal.aborted) setContentLoading(false); });
+    }, 300);
     return () => { clearTimeout(timer); controller.abort(); };
   }, [cwd, fileSearchOpen, searchQuery]);
 
@@ -1297,6 +1341,51 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
                     t={t}
                   />
                 ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasSearchQuery && (contentLoading || contentMatches.length > 0 || contentTruncated) && (
+          <div style={{ marginTop: 6, paddingTop: 4, borderTop: "1px solid var(--border)" }}>
+            <div style={{ padding: "2px 4px", fontSize: 10, color: "var(--text-dim)" }}>
+              {contentLoading
+                ? t("sidebar.searchingContents")
+                : t("sidebar.contentMatches", { count: contentMatches.length })}
+            </div>
+            {contentMatches.map((match, index) => (
+              <button
+                key={`${match.path}:${match.line}:${index}`}
+                type="button"
+                onClick={() => onOpenFile(joinFilePath(cwd, match.path), getFileName(match.path))}
+                title={`${match.path}:${match.line}`}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  boxSizing: "border-box",
+                  padding: "3px 8px",
+                  border: "none",
+                  borderRadius: 4,
+                  background: "none",
+                  color: "inherit",
+                  cursor: "pointer",
+                  textAlign: "left",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 11,
+                }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = "var(--bg-hover)"; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = "none"; }}
+              >
+                <div style={{ color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {match.path}<span style={{ color: "var(--text-dim)" }}>:{match.line}</span>
+                </div>
+                <div style={{ color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {match.text}
+                </div>
+              </button>
+            ))}
+            {contentTruncated && (
+              <div style={{ padding: "2px 4px", fontSize: 10, color: "var(--text-dim)" }}>
+                {t("sidebar.contentTruncated")}
               </div>
             )}
           </div>

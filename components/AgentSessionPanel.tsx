@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
-import { countRunningSubagents } from "@/lib/session-family";
+import { agentTreeOrder, countRunningSubagents } from "@/lib/session-family";
 import type { SessionUsageSummary } from "@/lib/session-stats";
 import { formatActiveDuration, formatCompactCount, formatCostShort } from "@/lib/session-stats-format";
 import type { SessionInfo, SubagentSessionStatus } from "@/lib/types";
@@ -173,6 +173,7 @@ function AgentRow({
   onSelect,
   tabShown,
   onToggleTab,
+  depth = 0,
 }: {
   session: SessionInfo;
   main?: boolean;
@@ -182,6 +183,8 @@ function AgentRow({
   onSelect: () => void;
   tabShown?: boolean;
   onToggleTab?: () => void;
+  /** 0 for a subagent the session itself spawned; +1 for each level below it. */
+  depth?: number;
 }) {
   const { locale, t } = useI18n();
   const relation = session.relation?.kind === "subagent" ? session.relation : null;
@@ -213,7 +216,8 @@ function AgentRow({
           gridTemplateColumns: "28px minmax(0, 1fr) auto",
           alignItems: "center",
           gap: 9,
-          padding: "7px 12px",
+          // A nested subagent sits indented under the one that spawned it.
+          padding: depth > 0 ? `7px 12px 7px ${12 + depth * 12}px` : "7px 12px",
           border: "none",
           background: "transparent",
           color: "var(--text)",
@@ -296,6 +300,12 @@ export function AgentSessionPanel({ rootSession, subagents, selectedSessionId, r
           .some((value) => value?.toLowerCase().includes(normalizedQuery));
       })
     : sortedSubagents;
+  // Search filters the flat list; the rows themselves are the family tree, so a
+  // nested subagent indents under its parent.
+  const orderedSubagents = useMemo(
+    () => agentTreeOrder(visibleSubagents, runningSessionIds),
+    [visibleSubagents, runningSessionIds],
+  );
   const runningCount = countRunningSubagents(subagents, runningSessionIds);
   const familyIds = useMemo(() => [rootSession.id, ...subagents.map((session) => session.id)], [rootSession.id, subagents]);
   const runningKey = familyIds.filter((id) => runningSessionIds.has(id)).join(",");
@@ -381,10 +391,11 @@ export function AgentSessionPanel({ rootSession, subagents, selectedSessionId, r
             usage={usage[rootSession.id]}
             onSelect={() => onSelectSession(rootSession)}
           />
-          {visibleSubagents.map((session) => (
+          {orderedSubagents.map(({ session, depth }) => (
             <AgentRow
               key={session.id}
               session={session}
+              depth={depth}
               selected={session.id === selectedSessionId}
               running={runningSessionIds.has(session.id)}
               usage={usage[session.id]}

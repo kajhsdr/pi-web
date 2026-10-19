@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo, type CSSProperties, type MouseEvent } from "react";
+import dynamic from "next/dynamic";
 import type { SyntaxHighlighterProps } from "react-syntax-highlighter";
 import SyntaxHighlighter from "react-syntax-highlighter/dist/esm/prism-light";
 import renderSyntaxNode from "react-syntax-highlighter/dist/esm/create-element";
@@ -19,12 +20,15 @@ import {
   isVideoPath,
 } from "@/lib/file-types";
 import { encodeFilePathForApi, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
+import { writeFileContent } from "@/lib/file-write";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { parseFrontmatter } from "@/lib/frontmatter";
 import { isExternalMarkdownHref, markdownAppUrlTransform, markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
 import { CodeBlock, MermaidBlock } from "./MermaidBlock";
 import { DelimitedTable } from "./DelimitedTable";
 import { isDelimitedTablePath } from "@/lib/delimited-table";
+import { isJsonlPath } from "@/lib/jsonl-records";
+import { JsonlRecords } from "./JsonlRecords";
 import { FrontmatterCard } from "./FrontmatterCard";
 import { diffGapLabel, parseUnifiedPatch } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
@@ -60,13 +64,23 @@ interface FileData {
   size: number;
   nextOffset: number;
   truncated: boolean;
+  /** The read's baseline for a save; absent from a server that cannot write. */
+  mtimeMs?: number;
 }
+
+// The editor and its grammars load on the first edit, keeping a read-only viewer
+// as light as it was.
+const CodeMirrorEditor = dynamic(
+  () => import("./CodeMirrorEditor").then((module) => module.CodeMirrorEditor),
+  { ssr: false },
+);
 
 const SOURCE_HIGHLIGHT_MAX_LINES = 1_000;
 const DISPLAY_MODE_LABELS: Record<DisplayMode, string> = {
   source: "Source",
   preview: "Preview",
   diff: "Diff",
+  records: "Records",
 };
 
 const FILE_CODE_STYLE: CSSProperties = {
@@ -1224,6 +1238,19 @@ function TextFileViewer({
   // Whole file for an HTML preview whose source view is still chunked.
   const [htmlFull, setHtmlFull] = useState<{ text?: string; error?: string } | null>(null);
 
+  // Editing. `draft` non-null opens the editor, which owns the text from then
+  // on; `draftRef` mirrors it so a save reads the latest without re-rendering
+  // the viewer on every keystroke.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [editorKey, setEditorKey] = useState(0);
+  const [dirty, setDirty] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "conflict" | "error">("idle");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const draftRef = useRef("");
+  const savedDraftRef = useRef("");
+  const dataRef = useRef<FileData | null>(null);
+  dataRef.current = data;
+
   onStateChangeRef.current = onStateChange;
 
   const updateDisplayMode = useCallback((nextDisplayMode: DisplayMode) => {
@@ -1314,6 +1341,76 @@ function TextFileViewer({
     }
   }, [cwd]);
 
+  const startEditing = useCallback(() => {
+    const current = dataRef.current;
+    if (!current || current.truncated || current.mtimeMs === undefined) return;
+    draftRef.current = current.content;
+    savedDraftRef.current = current.content;
+    setDirty(false);
+    setDraft(current.content);
+    setSaveState("idle");
+    setSaveError(null);
+    setEditorKey((key) => key + 1);
+  }, []);
+
+  const stopEditing = useCallback(() => {
+    setDraft(null);
+    setDirty(false);
+    setSaveState("idle");
+    setSaveError(null);
+  }, []);
+
+  const cancelEditing = useCallback(() => {
+    if (draftRef.current !== savedDraftRef.current && !window.confirm(t("files.discardChanges"))) return;
+    stopEditing();
+  }, [stopEditing, t]);
+
+  const handleDraftChange = useCallback((next: string) => {
+    draftRef.current = next;
+    const nextDirty = next !== savedDraftRef.current;
+    // Only a change of state re-renders: the editor keeps its own document.
+    setDirty((current) => current === nextDirty ? current : nextDirty);
+  }, []);
+
+  const saveDraft = useCallback(() => {
+    const current = dataRef.current;
+    if (!current || current.mtimeMs === undefined) return;
+    const content = draftRef.current;
+    setSaveState("saving");
+    setSaveError(null);
+    void writeFileContent({
+      filePath,
+      content,
+      expectedMtimeMs: current.mtimeMs,
+      sessionId: sourceSessionId,
+    }).then((result) => {
+      if (result.ok) {
+        savedDraftRef.current = content;
+        setDirty(false);
+        setSaveState("saved");
+        setData((prev) => (prev ? { ...prev, content, size: result.size, mtimeMs: result.mtimeMs } : prev));
+        return;
+      }
+      setSaveState(result.reason === "conflict" ? "conflict" : "error");
+      setSaveError(result.error);
+    });
+  }, [filePath, sourceSessionId]);
+
+  // A save refused because the file changed on disk: take what is there now.
+  const reloadFromDisk = useCallback(async () => {
+    const loaded = await fetchContent(filePath);
+    if (!loaded) return;
+    draftRef.current = loaded.content;
+    savedDraftRef.current = loaded.content;
+    setDraft(loaded.content);
+    setDirty(false);
+    setSaveState("idle");
+    setSaveError(null);
+    setEditorKey((key) => key + 1);
+  }, [fetchContent, filePath]);
+
+  const canEdit = Boolean(data && !data.truncated && data.mtimeMs !== undefined);
+
   // Reset and load the file itself when its identity changes. Live watching is
   // managed separately so pausing it never clears the displayed content.
   useEffect(() => {
@@ -1324,6 +1421,11 @@ function TextFileViewer({
     setGitDiff(null);
     setGitDiffResolved(false);
     setWatching(false);
+    // A different file never inherits the previous one's edits.
+    setDraft(null);
+    setDirty(false);
+    setSaveState("idle");
+    setSaveError(null);
 
     fetchContent(filePath).finally(() => {
       if (active) setLoading(false);
@@ -1342,7 +1444,9 @@ function TextFileViewer({
       esRef.current = null;
     }
 
-    if (!watchEnabled) return;
+    // Editing pauses live sync: a save would echo back as a change and reload
+    // the editor underneath the caret.
+    if (!watchEnabled || draft !== null) return;
 
     const synchronize = () => {
       void fetchContent(filePath);
@@ -1371,13 +1475,14 @@ function TextFileViewer({
       es.close();
       if (esRef.current === es) esRef.current = null;
     };
-  }, [filePath, fetchContent, fetchGitDiff, sourceSessionId, watchEnabled]);
+  }, [filePath, fetchContent, fetchGitDiff, sourceSessionId, watchEnabled, draft]);
 
   useEffect(() => {
     void fetchGitDiff(filePath);
   }, [fetchGitDiff, filePath, gitRefreshKey]);
 
   const isDelimitedTable = isDelimitedTablePath(filePath);
+  const isJsonl = isJsonlPath(filePath);
 
   useEffect(() => {
     // HTML gets the same rendered-first treatment as markdown: a generated page
@@ -1390,14 +1495,16 @@ function TextFileViewer({
       && data
       && (
         isDelimitedTable
+        || isJsonl
         || (data.language === "markdown" && !data.truncated)
         || (data.language === "html" && (!data.truncated || data.size <= HTML_PREVIEW_MAX_BYTES))
       )
     ) {
       defaultPreviewEligibleRef.current = false;
-      updateDisplayMode("preview");
+      // Records are a `.jsonl` file's own view; everything else here renders.
+      updateDisplayMode(isJsonl && !isDelimitedTable ? "records" : "preview");
     }
-  }, [data, isDelimitedTable, updateDisplayMode]);
+  }, [data, isDelimitedTable, isJsonl, updateDisplayMode]);
 
   // Large HTML: the source view loads 256 KB chunks, but a half document cannot
   // render, so the preview fetches the whole file once. A new `data` (watch
@@ -1636,6 +1743,7 @@ function TextFileViewer({
     ? ["diff"]
     : [
         "source",
+        ...(isJsonl ? ["records" as const] : []),
         ...(hasPreview ? ["preview" as const] : []),
         ...(hasGitDiff ? ["diff" as const] : []),
       ];
@@ -1751,6 +1859,21 @@ function TextFileViewer({
                 </button>
               </>
             )}
+            {effectiveDisplayMode === "source" && draft === null && (
+              <button
+                type="button"
+                onClick={startEditing}
+                disabled={!canEdit}
+                title={canEdit ? t("files.edit") : t("files.editUnavailable")}
+                aria-label={t("files.edit")}
+                className="file-viewer-icon-button"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M12 20h9" />
+                  <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                </svg>
+              </button>
+            )}
           </div>
 
           {!isDeletedDiff && <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />}
@@ -1788,6 +1911,60 @@ function TextFileViewer({
       )}
 
       {/* Content area */}
+      {draft !== null ? (
+        <>
+          <div
+            className="file-viewer-edit-bar"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "4px 12px",
+              borderBottom: "1px solid var(--border)",
+              background: "var(--bg-panel)",
+              fontSize: 11,
+              color: "var(--text-muted)",
+              flexShrink: 0,
+            }}
+          >
+            <span>{dirty ? t("files.unsavedChanges") : t("files.noChanges")}</span>
+            {saveState === "saving" && <span>{t("files.saving")}</span>}
+            {saveState === "conflict" && (
+              <span style={{ color: "#f87171" }}>{t("files.saveConflict")}</span>
+            )}
+            {saveState === "error" && <span style={{ color: "#f87171" }}>{saveError}</span>}
+            <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+              {saveState === "conflict" && (
+                <button type="button" className="file-viewer-mode-button" onClick={() => void reloadFromDisk()}>
+                  {t("files.reloadFromDisk")}
+                </button>
+              )}
+              <button
+                type="button"
+                className="file-viewer-mode-button"
+                onClick={saveDraft}
+                disabled={saveState === "saving" || !dirty}
+              >
+                {t("files.save")}
+              </button>
+              <button type="button" className="file-viewer-mode-button" onClick={cancelEditing}>
+                {t("files.cancelEdit")}
+              </button>
+            </div>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+            <CodeMirrorEditor
+              key={editorKey}
+              value={draft}
+              language={language}
+              wrap={wrapLines}
+              isDark={isDark}
+              onChange={handleDraftChange}
+              onSave={saveDraft}
+            />
+          </div>
+        </>
+      ) : (
       <div
         ref={contentRef}
         className="file-viewer-content"
@@ -1879,6 +2056,8 @@ function TextFileViewer({
               {markdownPreview}
             </ReactMarkdown>
           </div>
+        ) : isJsonl && effectiveDisplayMode === "records" ? (
+          <JsonlRecords content={content} complete={!data?.truncated} />
         ) : isDelimitedTable && effectiveDisplayMode === "preview" ? (
           <DelimitedTable
             content={content}
@@ -1903,6 +2082,7 @@ function TextFileViewer({
           highlightedSource
         )}
       </div>
+      )}
     </div>
   );
 }

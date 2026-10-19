@@ -38,6 +38,9 @@ type FileRequestType = typeof FILE_REQUEST_TYPES[number];
 const FILE_REQUEST_TYPE_SET = new Set<string>(FILE_REQUEST_TYPES);
 const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
+// A file saved by the editor. Larger files are preview-only, as the source
+// view already paginates them.
+const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
 
@@ -446,6 +449,103 @@ ${bodyHtml}
 </html>`;
 }
 
+/**
+ * Saving an existing file from the viewer's editor. The path must already be
+ * inside an allowed root and exist as a regular file: this writes, it never
+ * creates. A save landing on a file changed since it was read is refused with
+ * the current mtime, so the client offers a reload instead of overwriting.
+ */
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> }
+) {
+  if (!isApiRequestAllowed(request)) {
+    return NextResponse.json({ error: "Untrusted API request" }, { status: 403 });
+  }
+  if (!hasJsonContentType(request)) {
+    return NextResponse.json({ error: "Content-Type must be application/json" }, { status: 415 });
+  }
+
+  try {
+    const { path: segments } = await params;
+    const filePath = filePathFromApiSegments(segments);
+    if (hasParentDirectorySegment(filePath)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+
+    const allowedRoots = await getAllowedFileRoots();
+    if (!isFilePathAllowed(filePath, allowedRoots)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+    if (!stat.isFile()) {
+      return NextResponse.json({ error: "Not a file" }, { status: 400 });
+    }
+
+    // A link inside an allowed root can point outside it; resolve both sides
+    // before writing, as uploads do.
+    const realFile = fs.realpathSync(filePath);
+    const realRoots = new Set<string>();
+    for (const root of allowedRoots) {
+      try {
+        realRoots.add(fs.realpathSync(root));
+      } catch {
+        // Ignore stale session roots that no longer exist.
+      }
+    }
+    if (!isExistingFilePathAllowed(realFile, realRoots)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+
+    const body = await request.json().catch(() => null) as
+      { content?: unknown; expectedMtimeMs?: unknown } | null;
+    if (
+      typeof body?.content !== "string"
+      || typeof body.expectedMtimeMs !== "number"
+      || !Number.isFinite(body.expectedMtimeMs)
+    ) {
+      return NextResponse.json(
+        { error: "content must be a string and expectedMtimeMs a number" },
+        { status: 400 },
+      );
+    }
+    if (Buffer.byteLength(body.content, "utf8") > MAX_WRITE_BYTES) {
+      return NextResponse.json({ error: "Files above 8MB are read-only" }, { status: 413 });
+    }
+    if (stat.mtimeMs !== body.expectedMtimeMs) {
+      return NextResponse.json(
+        { error: "File changed on disk since it was read", mtimeMs: stat.mtimeMs, size: stat.size },
+        { status: 409 },
+      );
+    }
+
+    // A sibling temp file renamed over the original: a crash leaves the temp
+    // behind, never a half-written original.
+    const temporary = path.join(
+      path.dirname(realFile),
+      `.${path.basename(realFile)}.pi-web-${process.pid}-${Date.now()}.tmp`,
+    );
+    try {
+      fs.writeFileSync(temporary, body.content, { encoding: "utf8", mode: stat.mode });
+      fs.renameSync(temporary, realFile);
+    } catch (error) {
+      try { fs.unlinkSync(temporary); } catch { /* never created */ }
+      throw error;
+    }
+
+    const saved = fs.statSync(realFile);
+    return NextResponse.json({ mtimeMs: saved.mtimeMs, size: saved.size });
+  } catch (error) {
+    return NextResponse.json({ error: String(error) }, { status: 500 });
+  }
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> }
@@ -529,7 +629,9 @@ export async function GET(
       }
       const chunk = readTextPreviewChunk(filePath, stat.size, offset);
       const language = getLanguage(filePath);
-      return NextResponse.json({ ...chunk, language, size: stat.size });
+      // mtimeMs is the edit baseline: a save sends it back so a file changed on
+      // disk since it was read is refused rather than overwritten.
+      return NextResponse.json({ ...chunk, language, size: stat.size, mtimeMs: stat.mtimeMs });
     }
 
     if (type === "download") {

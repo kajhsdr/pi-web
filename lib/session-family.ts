@@ -95,3 +95,41 @@ export function getAgentsBadge(
   const running = countRunningSubagents(subagents, runningSessionIds);
   return running > 0 ? { count: running, running: true } : { count: subagents.length, running: false };
 }
+
+/**
+ * The family's subagents as a tree: each parent's children keep the flat
+ * list's order (running first, then newest), so a subagent spawned by another
+ * subagent sits indented under it instead of ahead of it. A relation naming a
+ * parent outside the family is treated as a child of the session itself.
+ */
+export function agentTreeOrder(
+  subagents: readonly SessionInfo[],
+  runningSessionIds: ReadonlySet<string>,
+): Array<{ session: SessionInfo; depth: number }> {
+  const known = new Set(subagents.map((session) => session.id));
+  const byParent = new Map<string | null, SessionInfo[]>();
+  for (const session of subagents) {
+    const parentSessionId = session.relation?.kind === "subagent" ? session.relation.parentSessionId : null;
+    const key = parentSessionId && known.has(parentSessionId) ? parentSessionId : null;
+    const siblings = byParent.get(key);
+    if (siblings) siblings.push(session);
+    else byParent.set(key, [session]);
+  }
+
+  const compare = (a: SessionInfo, b: SessionInfo) => {
+    const aRunning = runningSessionIds.has(a.id);
+    const bRunning = runningSessionIds.has(b.id);
+    if (aRunning !== bRunning) return aRunning ? -1 : 1;
+    return b.modified.localeCompare(a.modified);
+  };
+
+  const ordered: Array<{ session: SessionInfo; depth: number }> = [];
+  const walk = (parentId: string | null, depth: number) => {
+    for (const child of (byParent.get(parentId) ?? []).sort(compare)) {
+      ordered.push({ session: child, depth });
+      walk(child.id, depth + 1);
+    }
+  };
+  walk(null, 0);
+  return ordered;
+}
