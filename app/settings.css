@@ -2770,7 +2770,14 @@ select.mcp-add-input {
   flex-direction: column;
   gap: 6px;
 }
-.usage-heatmap-cell.is-hover {
+.usage-heatmap-cell {
+  cursor: pointer;
+}
+.usage-heatmap-cell.is-active {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+.usage-heatmap-cell:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
 }

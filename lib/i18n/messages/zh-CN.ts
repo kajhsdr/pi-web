@@ -29,6 +29,8 @@ export const zhCNLocale: LocalePlugin = {
     "usage.empty": "还没有调用记录",
     "usage.scanning": "正在扫描会话文件…",
     "usage.files": "已扫描 {count} 个会话文件",
+    "usage.heatmapDay": "{date}，{cost}，{tokens} tokens",
+    "usage.heatmapReadout": "{date} · {cost} · {tokens} tokens · {calls} 次调用",
     "usage.heatmapHint": "悬停方块查看当天用量",
     "usage.less": "少",
     "usage.more": "多",

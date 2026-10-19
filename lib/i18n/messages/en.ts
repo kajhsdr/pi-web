@@ -29,6 +29,8 @@ export const enLocale: LocalePlugin = {
     "usage.empty": "No usage recorded yet.",
     "usage.scanning": "Reading session files...",
     "usage.files": "{count} session files scanned",
+    "usage.heatmapDay": "{date}, {cost}, {tokens} tokens",
+    "usage.heatmapReadout": "{date} · {cost} · {tokens} tokens · {calls} calls",
     "usage.heatmapHint": "Hover a square for that day",
     "usage.less": "Less",
     "usage.more": "More",

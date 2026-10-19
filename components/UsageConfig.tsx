@@ -95,10 +95,14 @@ function SummaryCard({ label, totals }: { label: string; totals: UsageTotals }) 
   );
 }
 
-/** GitHub 那种方格图：一列一周，一行一天，颜色按当日 token 量分四档。 */
+/** GitHub 那种方格图：一列一周，一行一天，颜色按当日 token 量分四档。
+ *  颜色全部用主题变量拼，暗色主题下才跟着 --accent 走。 */
 function UsageHeatmap({ rows }: { rows: { key: string; totals: UsageTotals }[] }) {
   const { t } = useI18n();
-  const [hover, setHover] = useState<{ key: string; totals: UsageTotals } | null>(null);
+  const [hovered, setHovered] = useState<{ key: string; totals: UsageTotals } | null>(null);
+  // 触屏没有 hover：点一下（或键盘聚焦）就把读数留在原地。
+  const [picked, setPicked] = useState<{ key: string; totals: UsageTotals } | null>(null);
+
   const cells = useMemo(() => {
     const byDate = new Map(rows.map((row) => [row.key, row.totals]));
     const end = new Date();
@@ -115,36 +119,58 @@ function UsageHeatmap({ rows }: { rows: { key: string; totals: UsageTotals }[] }
   }, [rows]);
 
   const peak = Math.max(...cells.map((cell) => cell.totals.tokens.total), 1);
-  // 空单元格要跟着主题走：写死的透明黑在暗色主题下根本看不见。
   const shades = [
     "var(--bg-hover)",
-    "rgba(36,91,206,0.28)",
-    "rgba(36,91,206,0.5)",
-    "rgba(36,91,206,0.75)",
-    "rgba(36,91,206,1)",
+    "color-mix(in srgb, var(--accent) 28%, transparent)",
+    "color-mix(in srgb, var(--accent) 50%, transparent)",
+    "color-mix(in srgb, var(--accent) 75%, transparent)",
+    "var(--accent)",
   ];
+  const active = hovered ?? picked;
+
+  const pick = (cell: { key: string; totals: UsageTotals }) => setPicked(cell);
 
   return (
     <div className="usage-heatmap-block">
-      <div className="usage-heatmap" role="img" aria-label={t("usage.heatmap")}>
+      <div className="usage-heatmap" role="group" aria-label={t("usage.heatmap")}>
         {cells.map((cell) => {
           const tokens = cell.totals.tokens.total;
           const level = tokens === 0 ? 0 : Math.min(4, Math.max(1, Math.ceil((tokens / peak) * 4)));
           return (
             <div
               key={cell.key}
-              className={`usage-heatmap-cell${hover?.key === cell.key ? " is-hover" : ""}`}
+              className={`usage-heatmap-cell${active?.key === cell.key ? " is-active" : ""}`}
               style={{ background: shades[level] }}
-              onMouseEnter={() => setHover(cell)}
-              onMouseLeave={() => setHover(null)}
+              tabIndex={0}
+              role="button"
+              aria-label={t("usage.heatmapDay", {
+                date: cell.key,
+                cost: formatMoney(cell.totals.cost),
+                tokens: formatTokens(tokens),
+              })}
+              onMouseEnter={() => setHovered(cell)}
+              onMouseLeave={() => setHovered(null)}
+              onFocus={() => pick(cell)}
+              onClick={() => pick(cell)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  pick(cell);
+                }
+              }}
             />
           );
         })}
       </div>
       <div className="usage-heatmap-foot">
         <span className="usage-heatmap-readout">
-          {hover
-            ? `${hover.key} · ${formatMoney(hover.totals.cost)} · ${formatTokens(hover.totals.tokens.total)} tokens · ${hover.totals.calls} `
+          {active
+            ? t("usage.heatmapReadout", {
+                date: active.key,
+                cost: formatMoney(active.totals.cost),
+                tokens: formatTokens(active.totals.tokens.total),
+                calls: formatCount(active.totals.calls),
+              })
             : t("usage.heatmapHint")}
         </span>
         <span className="usage-heatmap-scale">

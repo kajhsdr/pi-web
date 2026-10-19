@@ -29,6 +29,8 @@ export const zhTWLocale: LocalePlugin = {
     "usage.empty": "還沒有呼叫記錄",
     "usage.scanning": "正在掃描會話檔案…",
     "usage.files": "已掃描 {count} 個會話檔案",
+    "usage.heatmapDay": "{date}，{cost}，{tokens} tokens",
+    "usage.heatmapReadout": "{date} · {cost} · {tokens} tokens · {calls} 次呼叫",
     "usage.heatmapHint": "懸停方塊查看當天用量",
     "usage.less": "少",
     "usage.more": "多",

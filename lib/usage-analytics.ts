@@ -34,8 +34,6 @@ declare global {
   var __piWebUsageCache: CacheState | undefined;
 }
 
-const SNAPSHOT_TTL_MS = 30_000;
-
 function getCacheState(): CacheState {
   if (!globalThis.__piWebUsageCache) {
     globalThis.__piWebUsageCache = { files: new Map(), snapshot: null, running: null };
@@ -177,10 +175,27 @@ async function scanFile(path: string): Promise<UsageBucketRow[]> {
   return [...buckets.values()];
 }
 
-/** 重算整份快照：先 stat 全部文件，只重解析变动过的。 */
-async function rebuild(): Promise<UsageSnapshot> {
+/** 文件没变就复用上次快照：stat 一遍全部文件只要几毫秒，比 TTL 更准，
+ *  刚结束的对话也能立刻出现在费用页。 */
+function snapshotIsCurrent(state: CacheState, files: string[]): boolean {
+  if (state.files.size !== files.length) return false;
+  for (const path of files) {
+    const cached = state.files.get(path);
+    if (!cached) return false;
+    let stat;
+    try {
+      stat = statSync(path);
+    } catch {
+      return false;
+    }
+    if (cached.size !== stat.size || cached.mtimeMs !== stat.mtimeMs) return false;
+  }
+  return true;
+}
+
+/** 重算整份快照：只重解析 size/mtime 变过的文件。 */
+async function rebuild(files: string[]): Promise<UsageSnapshot> {
   const state = getCacheState();
-  const files = listSessionFiles(sessionsRoot());
   const seen = new Set<string>();
 
   for (const path of files) {
@@ -218,15 +233,16 @@ async function rebuild(): Promise<UsageSnapshot> {
  * 费用快照。
  *
  * 首次要读全部 session 文件（几百个、几百 MB），所以并发调用共享同一个重建
- * 任务，不排队等多次全扫；30 秒内的重复请求直接用上次结果。
+ * 任务，不排队等多次全扫；文件指纹没变时直接返回上次结果。
  */
-export function getUsageSnapshot(): Promise<UsageSnapshot> {
+export function getUsageSnapshot(root: string = sessionsRoot()): Promise<UsageSnapshot> {
   const state = getCacheState();
   if (state.running) return state.running;
-  if (state.snapshot && state.snapshot.generatedAt > Date.now() - SNAPSHOT_TTL_MS) {
+  const files = listSessionFiles(root);
+  if (state.snapshot && snapshotIsCurrent(state, files)) {
     return Promise.resolve(state.snapshot);
   }
-  state.running = rebuild()
+  state.running = rebuild(files)
     .catch(() => state.snapshot ?? { buckets: [], files: 0, generatedAt: Date.now() })
     .finally(() => {
       state.running = null;
@@ -234,6 +250,7 @@ export function getUsageSnapshot(): Promise<UsageSnapshot> {
   return state.running;
 }
 
+/** 测试用：清空文件指纹与快照。 */
 export function resetUsageCacheForTests(): void {
   globalThis.__piWebUsageCache = undefined;
 }
