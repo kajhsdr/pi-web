@@ -31,14 +31,14 @@ interface CacheState {
 }
 
 declare global {
-  var __piWebUsageCache: CacheState | undefined;
+  var __piWebUsageCacheV2: CacheState | undefined;
 }
 
 function getCacheState(): CacheState {
-  if (!globalThis.__piWebUsageCache) {
-    globalThis.__piWebUsageCache = { files: new Map(), snapshot: null, running: null };
+  if (!globalThis.__piWebUsageCacheV2) {
+    globalThis.__piWebUsageCacheV2 = { files: new Map(), snapshot: null, running: null };
   }
-  return globalThis.__piWebUsageCache;
+  return globalThis.__piWebUsageCacheV2;
 }
 
 function addTokens(target: UsageTokens, source: UsageTokens): void {
@@ -100,11 +100,34 @@ function listSessionFiles(root: string): string[] {
   return found;
 }
 
+/** 首条用户消息的纯文本，用不到图片与工具块。 */
+function firstUserTextOf(line: string): string {
+  try {
+    const entry = JSON.parse(line) as { message?: { role?: string; content?: unknown } };
+    if (entry.message?.role !== "user") return "";
+    const content = entry.message.content;
+    if (typeof content === "string") return content.trim().slice(0, 80);
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const text = (block as { type?: string; text?: unknown })?.text;
+        if ((block as { type?: string })?.type === "text" && typeof text === "string") {
+          return text.trim().slice(0, 80);
+        }
+      }
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 /** 解析一个 session 文件里所有带 usage 的条目，聚成本文件内的桶。 */
 async function scanFile(path: string): Promise<UsageBucketRow[]> {
   const buckets = new Map<string, UsageBucketRow>();
   let sessionId = "";
   let cwd = "";
+  let title = "";
+  let firstUserText = "";
 
   const stream = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
@@ -112,7 +135,15 @@ async function scanFile(path: string): Promise<UsageBucketRow[]> {
     for await (const line of lines) {
       // 工具结果占了绝大部分体积，且一定不含 usage：先做子串判断再解析。
       if (!line.includes('"usage"')) {
-        if (line.includes('"type":"session"')) {
+        // 标题由 /name 或自动生成写进 session_info，最后一条生效。
+        if (line.includes('"type":"session_info"')) {
+          try {
+            const info = JSON.parse(line) as { name?: string };
+            title = typeof info.name === "string" && info.name.trim() ? info.name.trim() : "";
+          } catch {
+            // 坏了就沿用上一个标题
+          }
+        } else if (line.includes('"type":"session"')) {
           try {
             const header = JSON.parse(line) as { id?: string; cwd?: string };
             if (typeof header.id === "string") sessionId = header.id;
@@ -120,6 +151,9 @@ async function scanFile(path: string): Promise<UsageBucketRow[]> {
           } catch {
             // header 坏了不影响后面的统计
           }
+        } else if (!firstUserText && line.includes('"role":"user"')) {
+          // 没显式命名时用首条用户消息当标题，和侧栏会话列表一致。
+          firstUserText = firstUserTextOf(line);
         }
         continue;
       }
@@ -172,7 +206,11 @@ async function scanFile(path: string): Promise<UsageBucketRow[]> {
     lines.close();
     stream.destroy();
   }
-  return [...buckets.values()];
+  const rows = [...buckets.values()];
+  // 标题可能在末尾才出现，读完整份再回填；没命名的退回首条用户消息。
+  const label = title || firstUserText;
+  if (label) for (const row of rows) row.title = label;
+  return rows;
 }
 
 /** 文件没变就复用上次快照：stat 一遍全部文件只要几毫秒，比 TTL 更准，
@@ -252,5 +290,5 @@ export function getUsageSnapshot(root: string = sessionsRoot()): Promise<UsageSn
 
 /** 测试用：清空文件指纹与快照。 */
 export function resetUsageCacheForTests(): void {
-  globalThis.__piWebUsageCache = undefined;
+  globalThis.__piWebUsageCacheV2 = undefined;
 }

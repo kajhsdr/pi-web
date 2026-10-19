@@ -940,6 +940,8 @@ export interface UsageBucketRow extends UsageTotals {
   cwd: string;
   sessionId: string;
   model: string;
+  /** /name 或自动生成的会话标题；没设过就没有。 */
+  title?: string;
 }
 
 export interface UsageSnapshot {

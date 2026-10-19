@@ -319,6 +319,14 @@ export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean;
         .slice(0, 30),
     [filtered],
   );
+  const titleBySession = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const row of buckets) {
+      if (row.title) map.set(row.sessionId, row.title);
+    }
+    return map;
+  }, [buckets]);
+
   const todaySessionRows = useMemo(
     () => groupTotals(filtered.filter((row) => row.date === todayKey), (row) => row.sessionId || row.cwd),
     [filtered, todayKey],
@@ -413,7 +421,7 @@ export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean;
               <TotalsTable
                 rows={todaySessionRows}
                 firstHeader={t("usage.session")}
-                labelOf={(key) => (key.length > 8 ? key.slice(0, 8) : key)}
+                labelOf={(key) => titleBySession.get(key) || (key.length > 8 ? key.slice(0, 8) : key)}
                 emptyLabel={t("usage.empty")}
                 limit={20}
               />
