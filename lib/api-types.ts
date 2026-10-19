@@ -883,12 +883,29 @@ export interface PluginPackageInfo {
   status: "loaded" | "installed" | "missing" | "disabled";
 }
 
+export interface PluginTokenUsage {
+  /** 工具 promptSnippet / promptGuidelines 进系统提示词的增量。 */
+  prompt: number;
+  /** 活跃工具的 name + description + JSON schema。 */
+  decl: number;
+  /** 包内 skills 的 name + description 进系统提示词的增量。 */
+  skills: number;
+  /** prompt + decl：插件本身进上下文的量。 */
+  ext: number;
+  toolCount: number;
+  error?: string;
+}
+
 export interface PluginsResponse {
   packages: PluginPackageInfo[];
   standaloneExtensions: PluginStandaloneExtensionInfo[];
   totals: PluginResourceCounts;
   diagnostics: PluginDiagnostic[];
   projectResourcesLoaded: boolean;
+  /** 已算出的插件上下文占用，按 source 索引；算过的才在里面。 */
+  tokens?: Record<string, PluginTokenUsage>;
+  /** 还有插件在后台测，稍后再取一次。 */
+  tokensPending?: boolean;
 }
 
 /** One package of a bulk enable/disable; `error` means it was left as it was. */
@@ -900,4 +917,33 @@ export interface PluginToggleResult {
 
 export interface PluginsBulkResponse extends PluginsResponse {
   results: PluginToggleResult[];
+}
+
+/** 跨会话费用汇总，来自 /api/usage。 */
+export interface UsageTokens {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+}
+
+export interface UsageTotals {
+  tokens: UsageTokens;
+  cost: number;
+  calls: number;
+}
+
+/** 一个「日期 × 会话 × 模型」的花费桶；筛选与聚合全在前端做。 */
+export interface UsageBucketRow extends UsageTotals {
+  date: string;
+  cwd: string;
+  sessionId: string;
+  model: string;
+}
+
+export interface UsageSnapshot {
+  buckets: UsageBucketRow[];
+  files: number;
+  generatedAt: number;
 }

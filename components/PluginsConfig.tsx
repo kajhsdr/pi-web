@@ -5,6 +5,7 @@ import { sendAgentCommand } from "@/lib/agent-client";
 import type {
   PluginPackageInfo,
   PluginStandaloneExtensionInfo,
+  PluginTokenUsage,
   PluginUpdateResult,
   PluginsBulkResponse,
   PluginsResponse,
@@ -62,6 +63,19 @@ function normalizePluginSourceInput(value: string): string {
 
 function packageKey(pkg: Pick<PluginPackageInfo, "source" | "scope">): string {
   return `${pkg.scope}\0${pkg.source}`;
+}
+
+/** 三位一撇的数字，和终端里的合计行一个写法。 */
+function formatTokenCount(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+/** 上下文占用：合计 + 分项。prompt / tools / skills 是 pi 的三个来源。 */
+function contextUsageLabel(usage: PluginTokenUsage): string {
+  if (usage.error) return usage.error;
+  const parts = [`prompt ${formatTokenCount(usage.prompt)}`, `tools ${formatTokenCount(usage.decl)}`];
+  if (usage.skills > 0) parts.push(`skills ${formatTokenCount(usage.skills)}`);
+  return `${formatTokenCount(usage.ext)} tokens (${parts.join(" · ")})`;
 }
 
 /**
@@ -335,8 +349,10 @@ function PackageDetail({
   onAction,
   onCheckUpdate,
   onReloadSession,
+  usage,
 }: {
   pkg: PluginPackageInfo;
+  usage?: PluginTokenUsage;
   cwd: string;
   busyKey: string | null;
   actionError: string | null;
@@ -459,6 +475,9 @@ function PackageDetail({
             {description}
           </ConfigDetailGridRow>
         )}
+        <ConfigDetailGridRow label={t("i18n.contextCost")} mono>
+          {usage ? contextUsageLabel(usage) : t("i18n.contextPending")}
+        </ConfigDetailGridRow>
         <ConfigDetailGridRow
           label={t("i18n.status")}
           tone="plain"
@@ -597,12 +616,23 @@ export function PluginsConfig({
   const [checkingAll, setCheckingAll] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updatingAll, setUpdatingAll] = useState(false);
+  const [tokenTick, setTokenTick] = useState(0);
 
   const packages = useMemo(() => data?.packages ?? [], [data?.packages]);
   const standaloneExtensions = useMemo(() => data?.standaloneExtensions ?? [], [data?.standaloneExtensions]);
   const selectedPackage = packages.find((pkg) => packageKey(pkg) === selected) ?? null;
   const selectedExtension = standaloneExtensions.find((extension) => extensionKey(extension) === selected) ?? null;
   const projectResourcesLoaded = data?.projectResourcesLoaded ?? true;
+
+  const pluginTokens = useMemo(() => data?.tokens ?? {}, [data?.tokens]);
+  /** 已启用插件的上下文合计——面板上最该看的那个数。 */
+  const enabledTokens = useMemo(
+    () => packages.reduce(
+      (sum, pkg) => (pkg.disabled ? sum : sum + (pluginTokens[packageKey(pkg)]?.ext ?? 0)),
+      0,
+    ),
+    [packages, pluginTokens],
+  );
 
   const groupedPackages = useMemo(() => {
     return (["project", "global"] as PluginScope[])
@@ -637,6 +667,27 @@ export function PluginsConfig({
       setLoading(false);
     }
   }, [cwd]);
+
+  // 上下文占用是后台算的：还在算就隔一会儿补取，只换 tokens（整块重载会闪一下
+  // loading，并把当前选中的包重置掉）。失败就停，不重试：403/500 反复打列表
+  // 接口没意义，而探针卡死的情况有 40 次（约 1 分钟）封顶。
+  useEffect(() => {
+    if (!data?.tokensPending || tokenTick >= 40) return;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const res = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
+          if (!res.ok) return;
+          const next = (await res.json()) as PluginsResponse;
+          setData((current) => (current ? { ...current, tokens: next.tokens, tokensPending: next.tokensPending } : next));
+          setTokenTick((tick) => tick + 1);
+        } catch {
+          // 网络断了也停，下次手动刷新再说。
+        }
+      })();
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [cwd, data?.tokensPending, tokenTick]);
 
   useEffect(() => {
     setUpdateStatuses({});
@@ -983,6 +1034,19 @@ export function PluginsConfig({
                                   ↑
                                 </span>
                               )}
+                              {(pluginTokens[packageKey(pkg)]?.ext ?? 0) > 0 && (
+                                <span
+                                  title={t("i18n.contextCost")}
+                                  style={{
+                                    flexShrink: 0,
+                                    fontFamily: "var(--font-mono)",
+                                    fontSize: 10,
+                                    color: "var(--text-dim)",
+                                  }}
+                                >
+                                  {formatTokenCount(pluginTokens[packageKey(pkg)]?.ext ?? 0)}
+                                </span>
+                              )}
                             </ConfigSidebarItem>
                           );
                         })}
@@ -1035,6 +1099,7 @@ export function PluginsConfig({
                 onAction={runAction}
                 onCheckUpdate={() => void checkForUpdates(selectedPackage)}
                 onReloadSession={reloadSession}
+                usage={pluginTokens[packageKey(selectedPackage)]}
               />
               ) : (
                 <ConfigEmptyState>{t("i18n.selectPackage")}</ConfigEmptyState>
@@ -1058,7 +1123,13 @@ export function PluginsConfig({
                 details={data.diagnostics.map(diagnosticText)}
               />
             ) : (
-              <ConfigFooterStatus summary={data ? totalsSummary(data.totals, t) : ""} />
+              <ConfigFooterStatus
+                summary={data
+                  ? `${totalsSummary(data.totals, t)}${enabledTokens > 0
+                    ? ` · ${t("i18n.contextTotal", { count: formatTokenCount(enabledTokens) })}`
+                    : ""}`
+                  : ""}
+              />
             )}
         >
           {!embedded && <ConfigButton onClick={onClose}>{t("i18n.close")}</ConfigButton>}

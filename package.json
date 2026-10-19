@@ -31,6 +31,7 @@
     "!.next/dev",
     "!.next/**/*.js.map",
     "public",
+    "lib/plugin-token-probe.mjs",
     "next.config.ts",
     "package.json"
   ],

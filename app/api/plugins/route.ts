@@ -13,6 +13,7 @@ import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-acces
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import { getProjectTrustStatus } from "@/lib/project-trust";
 import { isPluginSourceCheckable } from "@/lib/plugin-updates";
+import { getPluginTokenSnapshot } from "@/lib/plugin-tokens";
 import { invalidateModelRuntimeWithExtensions } from "@/lib/model-runtime";
 import type {
   PluginDiagnostic,
@@ -399,6 +400,26 @@ async function readPlugins(cwd: string): Promise<PluginsResponse> {
   };
 }
 
+/**
+ * 插件列表 + 已算出的上下文占用。
+ *
+ * 探针要装载扩展、慢，所以这里只贴已知结果，缺的排到后台，`tokensPending`
+ * 告诉面板再取一次。
+ */
+async function withPluginTokens(cwd: string, pending: Promise<PluginsResponse>): Promise<PluginsResponse> {
+  const plugins = await pending;
+  const snapshot = getPluginTokenSnapshot(
+    cwd,
+    plugins.packages.map((pkg) => ({
+      source: pkg.source,
+      scope: pkg.scope,
+      installedPath: pkg.installedPath,
+      version: pkg.version,
+    })),
+  );
+  return { ...plugins, tokens: snapshot.tokens, tokensPending: snapshot.pending };
+}
+
 function readScope(scope: unknown): PluginScope {
   return scope === "project" ? "project" : "global";
 }
@@ -413,7 +434,7 @@ export async function GET(req: Request) {
     if (!isExistingFilePathAllowed(cwd, allowedRoots)) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
-    return NextResponse.json(await readPlugins(cwd));
+    return NextResponse.json(await withPluginTokens(cwd, readPlugins(cwd)));
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }
@@ -465,7 +486,7 @@ export async function POST(req: Request) {
         body.action === "disable",
         projectTrust.trusted,
       );
-      return NextResponse.json({ ...(await readPlugins(body.cwd)), results } satisfies PluginsBulkResponse);
+      return NextResponse.json({ ...(await withPluginTokens(body.cwd, readPlugins(body.cwd))), results } satisfies PluginsBulkResponse);
     }
 
     const scope = readScope(body.scope);
@@ -509,7 +530,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `Unsupported action: ${body.action}` }, { status: 400 });
     }
 
-    return NextResponse.json(await readPlugins(body.cwd));
+    return NextResponse.json(await withPluginTokens(body.cwd, readPlugins(body.cwd)));
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
   } finally {

@@ -32,6 +32,7 @@ import { setupPushSubscription } from "@/lib/push-client";
 import { SkillsConfig } from "./SkillsConfig";
 import { AgentsConfig } from "./AgentsConfig";
 import { PluginsConfig } from "./PluginsConfig";
+import { UsageConfig } from "./UsageConfig";
 import { McpConfig } from "./McpConfig";
 import { ConfigButton, ConfigSwitch } from "./SettingsUi";
 import { FontSettings } from "./FontSettings";
@@ -527,6 +528,7 @@ export function SettingsPanel({
     { id: "agents", label: t("common.agents") },
     { id: "plugins", label: t("common.plugins") },
     { id: "mcp", label: t("settings.mcp") },
+    { id: "usage", label: t("common.usage") },
   ] as const).map((item) => ({ ...item, requiresProject: settingsSectionRequiresProject(item.id) }));
   const sectionRequiresProject = settingsSectionRequiresProject(section);
 
@@ -627,6 +629,8 @@ export function SettingsPanel({
           {cwd && sectionHost("plugins", <PluginsConfig embedded key={cwd} cwd={cwd} sessionId={sessionId} trust={projectTrust} onClose={onClose} onReloaded={onSessionReloaded} />)}
           {/* No project needed: the global mcp.json is listed alone, and a project adds its group. */}
           {sectionHost("mcp", <McpConfig embedded key={cwd ?? ""} cwd={cwd} trust={projectTrust} onTrustProject={onOpenTrustDialog} onProjectTrustChanged={onProjectTrustChanged} onClose={onClose} />)}
+          {/* 费用：全局统计，不需要项目 */}
+          {sectionHost("usage", <UsageConfig embedded onClose={onClose} />)}
         </main>
       </div>
     </div>
