@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
+import { randomUUID } from "node:crypto";
+import lockfile from "proper-lockfile";
+import { serializeByKey } from "@/lib/key-serializer";
 import {
   allowFileRoot,
   getAllowedFileRoots,
@@ -41,6 +44,7 @@ const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 // A file saved by the editor. Larger files are preview-only, as the source
 // view already paginates them.
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
+const FILE_WRITE_QUEUE = Symbol.for("pi-web:file-write-queue");
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
 
@@ -473,36 +477,7 @@ export async function PUT(
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    const allowedRoots = await getAllowedFileRoots();
-    if (!isFilePathAllowed(filePath, allowedRoots)) {
-      return NextResponse.json({ error: "Access denied" }, { status: 403 });
-    }
-
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(filePath);
-    } catch {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
-    if (!stat.isFile()) {
-      return NextResponse.json({ error: "Not a file" }, { status: 400 });
-    }
-
-    // A link inside an allowed root can point outside it; resolve both sides
-    // before writing, as uploads do.
-    const realFile = fs.realpathSync(filePath);
-    const realRoots = new Set<string>();
-    for (const root of allowedRoots) {
-      try {
-        realRoots.add(fs.realpathSync(root));
-      } catch {
-        // Ignore stale session roots that no longer exist.
-      }
-    }
-    if (!isExistingFilePathAllowed(realFile, realRoots)) {
-      return NextResponse.json({ error: "Access denied" }, { status: 403 });
-    }
-
+    // 先读完请求体，之后取得的文件状态才是本次保存的最新基线。
     const body = await request.json().catch(() => null) as
       { content?: unknown; expectedMtimeMs?: unknown } | null;
     if (
@@ -515,32 +490,85 @@ export async function PUT(
         { status: 400 },
       );
     }
-    if (Buffer.byteLength(body.content, "utf8") > MAX_WRITE_BYTES) {
+    const content = body.content;
+    const expectedMtimeMs = body.expectedMtimeMs;
+    if (Buffer.byteLength(content, "utf8") > MAX_WRITE_BYTES) {
       return NextResponse.json({ error: "Files above 8MB are read-only" }, { status: 413 });
     }
-    if (stat.mtimeMs !== body.expectedMtimeMs) {
-      return NextResponse.json(
-        { error: "File changed on disk since it was read", mtimeMs: stat.mtimeMs, size: stat.size },
-        { status: 409 },
-      );
-    }
 
-    // A sibling temp file renamed over the original: a crash leaves the temp
-    // behind, never a half-written original.
-    const temporary = path.join(
-      path.dirname(realFile),
-      `.${path.basename(realFile)}.pi-web-${process.pid}-${Date.now()}.tmp`,
-    );
+    const allowedRoots = await getAllowedFileRoots();
+    if (!isFilePathAllowed(filePath, allowedRoots)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+    let realFile: string;
     try {
-      fs.writeFileSync(temporary, body.content, { encoding: "utf8", mode: stat.mode });
-      fs.renameSync(temporary, realFile);
-    } catch (error) {
-      try { fs.unlinkSync(temporary); } catch { /* never created */ }
-      throw error;
+      realFile = fs.realpathSync(filePath);
+    } catch {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+    if (!isExistingFilePathAllowed(realFile, allowedRoots)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    const saved = fs.statSync(realFile);
-    return NextResponse.json({ mtimeMs: saved.mtimeMs, size: saved.size });
+    // 相同真实路径的保存共用队列及跨进程锁，别名也不能绕过冲突检查。
+    const queueKey = process.platform === "win32" ? realFile.toLowerCase() : realFile;
+    return await serializeByKey(FILE_WRITE_QUEUE, queueKey, async () => {
+      let release: () => Promise<void>;
+      try {
+        release = await lockfile.lock(realFile, {
+          realpath: false,
+          lockfilePath: path.join(path.dirname(realFile), `.${path.basename(realFile)}.pi-web-save.lock`),
+          stale: 10_000,
+          retries: { retries: 10, factor: 2, minTimeout: 25, maxTimeout: 500 },
+          onCompromised: (error: Error) => {
+            console.warn(`[pi-web] file save lock compromised: ${error.message}`);
+          },
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ELOCKED") {
+          return NextResponse.json({ error: "Another process is saving this file" }, { status: 409 });
+        }
+        throw error;
+      }
+      try {
+        // 等待锁期间，文件或链接可能已变化；再次检查授权及实际文件身份。
+        if (!samePath(fs.realpathSync(filePath), realFile) || !isExistingFilePathAllowed(realFile, allowedRoots)) {
+          return NextResponse.json({ error: "Access denied" }, { status: 403 });
+        }
+        const stat = fs.statSync(realFile);
+        if (!stat.isFile()) {
+          return NextResponse.json({ error: "Not a file" }, { status: 400 });
+        }
+        if (stat.mtimeMs !== expectedMtimeMs) {
+          return NextResponse.json(
+            { error: "File changed on disk since it was read", mtimeMs: stat.mtimeMs, size: stat.size },
+            { status: 409 },
+          );
+        }
+
+        const temporary = path.join(path.dirname(realFile), `.${path.basename(realFile)}.pi-web-${randomUUID()}.tmp`);
+        try {
+          fs.writeFileSync(temporary, content, { encoding: "utf8", mode: stat.mode, flag: "wx" });
+          // 外部编辑器未必使用本锁，写完临时文件后再检查一次原文件。
+          const current = fs.statSync(realFile);
+          if (current.mtimeMs !== stat.mtimeMs || current.size !== stat.size || current.ino !== stat.ino) {
+            fs.unlinkSync(temporary);
+            return NextResponse.json(
+              { error: "File changed on disk since it was read", mtimeMs: current.mtimeMs, size: current.size },
+              { status: 409 },
+            );
+          }
+          fs.renameSync(temporary, realFile);
+        } catch (error) {
+          try { fs.unlinkSync(temporary); } catch { /* 临时文件可能尚未创建。 */ }
+          throw error;
+        }
+        const saved = fs.statSync(realFile);
+        return NextResponse.json({ mtimeMs: saved.mtimeMs, size: saved.size });
+      } finally {
+        await release();
+      }
+    });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

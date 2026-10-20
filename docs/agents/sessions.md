@@ -29,6 +29,7 @@ pi's `navigateTree()` refuses while streaming or compacting: the file has one le
 
 ## Session files can be fully rewritten
 `parentSession` in the header is **display metadata only**, so rewriting the whole file with `writeFileSync` is safe (pi does it in migrations); cascade-reparenting children on delete relies on this.
+- 费用去重还需要删除前的来源关系：`deleteSessions()` 在重写存活子会话头部时，把完整计费祖先路径保存在 `piWebUsageAncestorPaths`，同时照常重指向或清除 `parentSession`。该字段只用于费用统计，不影响侧栏 fork/subagent 关系；同批、连续删除中间祖先时都要传递已有来源，不能仅保留新的 UI 父路径。
 
 ## ToolCall field normalization
 Pi stores `{type:"toolCall", id, name, arguments}`; `ToolCallContent` uses `{toolCallId, toolName, input}`. `normalizeToolCalls()` (`lib/normalize.ts`) converts in both `session-reader.ts` (file load) and `handleAgentEvent` (`hooks/useAgentSession.ts`, streaming).

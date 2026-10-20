@@ -71,7 +71,7 @@ import type { ChatInputHandle } from "./ChatInput";
 import type { AgentEndInfo, NewSessionChoices } from "@/hooks/useAgentSession";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { formatActiveDuration, formatCompactCount, formatCostShort } from "@/lib/session-stats-format";
-import type { FileViewerState } from "@/lib/file-viewer-state";
+import { hasUnsavedFileDraft, type FileViewerState } from "@/lib/file-viewer-state";
 import { PRESET_READ_ONLY, type ToolEntry } from "@/lib/tool-presets";
 import { getAgentsBadge, getSessionFamily } from "@/lib/session-family";
 import { getLastSettingsSection, settingsSectionRequiresProject, type SettingsSection } from "@/lib/settings-navigation";
@@ -576,6 +576,21 @@ export function AppShell() {
       }));
     } catch { /* storage is optional */ }
   }, [terminalTabs, activeFileTabId, rightPanelOpen, terminalsRestored]);
+
+  // viewer 共享草稿对象，因此即使输入或保存没有触发 AppShell 重渲染，
+  // 离开页面时也能检查到最新的草稿状态。
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      const hasDraft = fileTabs.some((tab) => hasUnsavedFileDraft(tab.viewerState))
+        || [...fileWorkspaceStatesRef.current.values()].some((workspace) =>
+          workspace.tabs.some((tab) => hasUnsavedFileDraft(tab.viewerState)));
+      if (!hasDraft) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, [fileTabs]);
 
   const handleFileViewerStateChange = useCallback((
     generation: number,
@@ -1254,6 +1269,8 @@ export function AppShell() {
       if (fileTabs.length === 0 && terminalTabs.length === 0 && remainingAgents.length === 0) setRightPanelOpen(false);
       return;
     }
+    const closingFile = fileTabs.find((tab) => tab.id === tabId);
+    if (hasUnsavedFileDraft(closingFile?.viewerState) && !window.confirm(translate("files.discardChanges"))) return;
     setFileTabs((prev) => {
       const next = prev.filter((t) => t.id !== tabId);
       if (next.length === 0 && terminalTabs.length === 0 && agentTabs.length === 0) setRightPanelOpen(false);
@@ -1264,7 +1281,7 @@ export function AppShell() {
       const remaining = fileTabs.filter((t) => t.id !== tabId);
       return remaining.at(-1)?.id ?? terminalTabs.at(-1)?.id ?? lastAgentTabId(agentTabs);
     });
-  }, [fileTabs, terminalTabs, agentTabs]);
+  }, [fileTabs, terminalTabs, agentTabs, translate]);
 
   const handleViewFullHistory = useCallback(() => {
     if (!selectedSession) return;

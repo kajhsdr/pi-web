@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { ConfigPanelShell, ConfigSectionTitle } from "./SettingsUi";
+import { localUsageDateKey as localDateKey, usageWindowStart } from "@/lib/usage-calendar";
 import type { UsageBucketRow, UsageSnapshot, UsageTokens, UsageTotals } from "@/lib/api-types";
 
 /** 小额要看到四位小数，量级上去了收成两位，和官方账单的读法一致。 */
@@ -22,14 +23,6 @@ function formatTokens(value: number): string {
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat("en-US").format(value);
-}
-
-function pad(value: number): string {
-  return `${value}`.padStart(2, "0");
-}
-
-function localDateKey(date: Date): string {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 function emptyTokens(): UsageTokens {
@@ -97,15 +90,15 @@ function SummaryCard({ label, totals }: { label: string; totals: UsageTotals }) 
 
 /** GitHub 那种方格图：一列一周，一行一天，颜色按当日 token 量分四档。
  *  颜色全部用主题变量拼，暗色主题下才跟着 --accent 走。 */
-function UsageHeatmap({ rows }: { rows: { key: string; totals: UsageTotals }[] }) {
+function UsageHeatmap({ rows, todayKey }: { rows: { key: string; totals: UsageTotals }[]; todayKey: string }) {
   const { t } = useI18n();
-  const [hovered, setHovered] = useState<{ key: string; totals: UsageTotals } | null>(null);
-  // 触屏没有 hover：点一下（或键盘聚焦）就把读数留在原地。
-  const [picked, setPicked] = useState<{ key: string; totals: UsageTotals } | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
+  // 只保存日期 key；totals 始终从当前筛选后的方格中读取。
+  const [picked, setPicked] = useState<string | null>(null);
 
   const cells = useMemo(() => {
     const byDate = new Map(rows.map((row) => [row.key, row.totals]));
-    const end = new Date();
+    const end = new Date(`${todayKey}T12:00:00`);
     end.setHours(0, 0, 0, 0);
     const start = new Date(end);
     start.setDate(start.getDate() - (26 * 7 - 1));
@@ -116,7 +109,7 @@ function UsageHeatmap({ rows }: { rows: { key: string; totals: UsageTotals }[] }
       out.push({ key, totals: byDate.get(key) ?? emptyTotals() });
     }
     return out;
-  }, [rows]);
+  }, [rows, todayKey]);
 
   const peak = Math.max(...cells.map((cell) => cell.totals.tokens.total), 1);
   const shades = [
@@ -126,9 +119,10 @@ function UsageHeatmap({ rows }: { rows: { key: string; totals: UsageTotals }[] }
     "color-mix(in srgb, var(--accent) 75%, transparent)",
     "var(--accent)",
   ];
-  const active = hovered ?? picked;
+  const activeKey = hovered ?? picked;
+  const active = cells.find((cell) => cell.key === activeKey);
 
-  const pick = (cell: { key: string; totals: UsageTotals }) => setPicked(cell);
+  const pick = (cell: { key: string }) => setPicked(cell.key);
 
   return (
     <div className="usage-heatmap-block">
@@ -148,7 +142,7 @@ function UsageHeatmap({ rows }: { rows: { key: string; totals: UsageTotals }[] }
                 cost: formatMoney(cell.totals.cost),
                 tokens: formatTokens(tokens),
               })}
-              onMouseEnter={() => setHovered(cell)}
+              onMouseEnter={() => setHovered(cell.key)}
               onMouseLeave={() => setHovered(null)}
               onFocus={() => pick(cell)}
               onClick={() => pick(cell)}
@@ -227,7 +221,7 @@ function TotalsTable({
   );
 }
 
-export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean; onClose: () => void }) {
+export function UsageConfig({ embedded = false, visible = true, onClose }: { embedded?: boolean; visible?: boolean; onClose: () => void }) {
   const { t } = useI18n();
   const [data, setData] = useState<UsageSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -236,24 +230,49 @@ export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean;
   const [model, setModel] = useState("all");
   const [range, setRange] = useState<"today" | "90d">("today");
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/usage");
-      const next = (await res.json()) as UsageSnapshot & { error?: string };
-      if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
-      setData(next);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const [todayKey, setTodayKey] = useState(() => localDateKey(new Date()));
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (!visible) return;
+    let controller: AbortController | undefined;
+    let midnight: ReturnType<typeof setTimeout> | undefined;
+    const refresh = () => {
+      controller?.abort();
+      clearTimeout(midnight);
+      if (document.hidden) return;
+      const now = new Date();
+      setTodayKey(localDateKey(now));
+      const nextDay = new Date(now);
+      nextDay.setHours(24, 0, 0, 0);
+      midnight = setTimeout(refresh, nextDay.getTime() - now.getTime());
+      const request = new AbortController();
+      controller = request;
+      const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      setData((current) => current?.timeZone === timeZone ? current : null);
+      setLoading(true);
+      setError(null);
+      void (async () => {
+        try {
+          const res = await fetch(`/api/usage?timeZone=${encodeURIComponent(timeZone)}`, { signal: request.signal });
+          const next = (await res.json()) as UsageSnapshot & { error?: string };
+          if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
+          if (next.timeZone !== timeZone) throw new Error("Usage snapshot time zone mismatch");
+          if (!request.signal.aborted) setData(next);
+        } catch (err) {
+          if (!request.signal.aborted) setError(err instanceof Error ? err.message : String(err));
+        } finally {
+          if (!request.signal.aborted) setLoading(false);
+        }
+      })();
+    };
+    refresh();
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      controller?.abort();
+      clearTimeout(midnight);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [visible]);
 
   const buckets = useMemo(() => data?.buckets ?? [], [data?.buckets]);
 
@@ -275,10 +294,8 @@ export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean;
     [buckets, project, model],
   );
 
-  const todayKey = localDateKey(new Date());
   const monthKey = todayKey.slice(0, 7);
-  // 「近 90 天」要真有下限，否则按钮文案在说谡。
-  const windowStart = useMemo(() => localDateKey(new Date(Date.now() - 89 * 86_400_000)), []);
+  const windowStart = usageWindowStart(todayKey);
 
   const totals = useMemo(() => {
     const today = emptyTotals();
@@ -306,7 +323,7 @@ export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean;
   const modelRows = useMemo(
     () =>
       groupTotals(
-        filtered.filter((row) => range === "today" ? row.date === todayKey : row.date >= windowStart),
+        filtered.filter((row) => range === "today" ? row.date === todayKey : row.date >= windowStart && row.date <= todayKey),
         (row) => row.model,
       ),
     [filtered, range, todayKey, windowStart],
@@ -375,7 +392,7 @@ export function UsageConfig({ embedded = false, onClose }: { embedded?: boolean;
 
             <section className="usage-section">
               <ConfigSectionTitle>{t("usage.heatmap")}</ConfigSectionTitle>
-              <UsageHeatmap rows={groupTotals(filtered, (row) => row.date)} />
+              <UsageHeatmap rows={groupTotals(filtered, (row) => row.date)} todayKey={todayKey} />
             </section>
 
             <section className="usage-section">

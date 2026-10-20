@@ -617,6 +617,21 @@ export function PluginsConfig({
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updatingAll, setUpdatingAll] = useState(false);
   const [tokenTick, setTokenTick] = useState(0);
+  // 每个项目独立请求代次，刷新或操作开始后，旧轮询不能再覆盖新结果。
+  const requestScope = useMemo(() => ({ cwd, active: true, generation: 0 }), [cwd]);
+  useEffect(() => {
+    requestScope.active = true;
+    return () => { requestScope.active = false; };
+  }, [requestScope]);
+  const beginRequest = useCallback(() => {
+    // 新操作接管请求代次时，也接管旧列表请求的 loading，不能等待已过期的 finally。
+    setLoading(false);
+    setTokenTick(0);
+    return ++requestScope.generation;
+  }, [requestScope]);
+  const isCurrentRequest = useCallback((generation: number) => (
+    requestScope.active && requestScope.generation === generation
+  ), [requestScope]);
 
   const packages = useMemo(() => data?.packages ?? [], [data?.packages]);
   const standaloneExtensions = useMemo(() => data?.standaloneExtensions ?? [], [data?.standaloneExtensions]);
@@ -641,12 +656,15 @@ export function PluginsConfig({
   }, [packages]);
 
   const loadPlugins = useCallback(async () => {
+    if (!requestScope.active) return;
+    const generation = beginRequest();
     setLoading(true);
     setError(null);
     setGroupStatus(null);
     try {
       const res = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
       const next = (await res.json()) as PluginsResponse & { error?: string };
+      if (!isCurrentRequest(generation)) return;
       if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
       setData(next);
       setAddMode((current) => (next.packages.length === 0 && next.standaloneExtensions.length === 0) || current);
@@ -662,36 +680,59 @@ export function PluginsConfig({
             : null;
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (isCurrentRequest(generation)) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (isCurrentRequest(generation)) setLoading(false);
     }
-  }, [cwd]);
+  }, [cwd, beginRequest, isCurrentRequest, requestScope]);
 
-  // 上下文占用是后台算的：还在算就隔一会儿补取，只换 tokens（整块重载会闪一下
-  // loading，并把当前选中的包重置掉）。失败就停，不重试：403/500 反复打列表
-  // 接口没意义，而探针卡死的情况有 40 次（约 1 分钟）封顶。
+  // 每批最多等待 150 秒，覆盖后端 120 秒超时；批次变化和手动操作都重新计时。
+  useEffect(() => { setTokenTick(0); }, [data?.tokenBatch]);
   useEffect(() => {
-    if (!data?.tokensPending || tokenTick >= 40) return;
+    if (!data?.tokensPending || loading || busyKey || updatingAll) return;
+    const generation = requestScope.generation;
+    let cancelled = false;
+    const stopWaiting = (message: string) => {
+      if (cancelled || !isCurrentRequest(generation)) return;
+      setData((current) => {
+        if (!current) return current;
+        const tokens = { ...current.tokens };
+        for (const pkg of current.packages) {
+          const key = packageKey(pkg);
+          if (!tokens[key]) tokens[key] = { prompt: 0, decl: 0, skills: 0, ext: 0, toolCount: 0, error: message };
+        }
+        return { ...current, tokens, tokensPending: false };
+      });
+    };
     const timer = setTimeout(() => {
       void (async () => {
+        if (tokenTick >= 100) {
+          stopWaiting("Context measurement timed out; refresh to retry.");
+          return;
+        }
         try {
           const res = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
-          if (!res.ok) return;
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const next = (await res.json()) as PluginsResponse;
-          setData((current) => (current ? { ...current, tokens: next.tokens, tokensPending: next.tokensPending } : next));
+          if (cancelled || !isCurrentRequest(generation)) return;
+          setData((current) => (current ? { ...current, tokens: next.tokens, tokensPending: next.tokensPending, tokenBatch: next.tokenBatch } : next));
           setTokenTick((tick) => tick + 1);
-        } catch {
-          // 网络断了也停，下次手动刷新再说。
+        } catch (err) {
+          stopWaiting(err instanceof Error ? err.message : String(err));
         }
       })();
     }, 1500);
-    return () => clearTimeout(timer);
-  }, [cwd, data?.tokensPending, tokenTick]);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [cwd, data?.tokensPending, data?.tokenBatch, tokenTick, loading, busyKey, updatingAll, requestScope, isCurrentRequest]);
 
   useEffect(() => {
     setUpdateStatuses({});
     setUpdateError(null);
+    setData(null);
+    setBusyKey(null);
+    setUpdatingAll(false);
+    setCheckingUpdates(new Set());
+    setCheckingAll(false);
     void loadPlugins();
   }, [cwd]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -734,6 +775,7 @@ export function PluginsConfig({
         updates?: PluginUpdateResult[];
         error?: string;
       };
+      if (!requestScope.active) return;
       if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
       setUpdateStatuses((current) => {
         const next = { ...current };
@@ -743,18 +785,21 @@ export function PluginsConfig({
         return next;
       });
     } catch (err) {
-      setUpdateError(err instanceof Error ? err.message : String(err));
+      if (requestScope.active) setUpdateError(err instanceof Error ? err.message : String(err));
     } finally {
-      setCheckingUpdates((current) => {
-        const next = new Set(current);
-        for (const key of keys) next.delete(key);
-        return next;
-      });
-      if (!pkg) setCheckingAll(false);
+      if (requestScope.active) {
+        setCheckingUpdates((current) => {
+          const next = new Set(current);
+          for (const key of keys) next.delete(key);
+          return next;
+        });
+        if (!pkg) setCheckingAll(false);
+      }
     }
-  }, [cwd, packages]);
+  }, [cwd, packages, requestScope]);
 
   const updateAllPluginsAction = useCallback(async () => {
+    const generation = beginRequest();
     setUpdatingAll(true);
     setActionError(null);
     setActionMessage(null);
@@ -766,6 +811,7 @@ export function PluginsConfig({
         body: JSON.stringify({ action: "update", cwd }),
       });
       const next = (await res.json()) as PluginsResponse & { error?: string };
+      if (!isCurrentRequest(generation)) return;
       if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
       setData(next);
       setUpdateStatuses({});
@@ -774,13 +820,14 @@ export function PluginsConfig({
         setActionMessage(`${t("i18n.packagesUpdated")} ${t("agents.reloadRequired")}`);
       }
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      if (isCurrentRequest(generation)) setActionError(err instanceof Error ? err.message : String(err));
     } finally {
-      setUpdatingAll(false);
+      if (isCurrentRequest(generation)) setUpdatingAll(false);
     }
-  }, [cwd, sessionId, t]);
+  }, [cwd, sessionId, t, beginRequest, isCurrentRequest]);
 
   const runAction = useCallback(async (action: PluginAction, pkg: PluginPackageInfo) => {
+    const generation = beginRequest();
     const key = packageKey(pkg);
     setBusyKey(`${action}:${key}`);
     setActionError(null);
@@ -793,6 +840,7 @@ export function PluginsConfig({
         body: JSON.stringify({ action, source: pkg.source, scope: pkg.scope, cwd }),
       });
       const next = (await res.json()) as PluginsResponse & { error?: string };
+      if (!isCurrentRequest(generation)) return;
       if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
       setData(next);
       if (action === "remove") {
@@ -825,11 +873,11 @@ export function PluginsConfig({
         }
       }
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      if (isCurrentRequest(generation)) setActionError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusyKey(null);
+      if (isCurrentRequest(generation)) setBusyKey(null);
     }
-  }, [cwd, t]);
+  }, [cwd, t, beginRequest, isCurrentRequest]);
 
   // Behaves like the package switch, for every package of one scope: the
   // confirmation appears in the package detail and the session is reloaded by
@@ -847,6 +895,7 @@ export function PluginsConfig({
     setActionMessage(null);
     setGroupStatus(note ? { scope, note } : null);
     if (targets.length === 0) return;
+    const generation = beginRequest();
     const action = enabled ? "enable" : "disable";
     setBusyKey(`bulk:${scope}`);
     try {
@@ -860,6 +909,7 @@ export function PluginsConfig({
         }),
       });
       const next = (await res.json()) as Partial<PluginsBulkResponse> & { error?: string };
+      if (!isCurrentRequest(generation)) return;
       if (!res.ok || next.error || !next.results) throw new Error(next.error ?? `HTTP ${res.status}`);
       const { results, ...plugins } = next as PluginsBulkResponse;
       setData(plugins);
@@ -879,15 +929,16 @@ export function PluginsConfig({
         });
       }
     } catch (err) {
-      setGroupStatus({ scope, note, error: err instanceof Error ? err.message : String(err) });
+      if (isCurrentRequest(generation)) setGroupStatus({ scope, note, error: err instanceof Error ? err.message : String(err) });
     } finally {
-      setBusyKey(null);
+      if (isCurrentRequest(generation)) setBusyKey(null);
     }
-  }, [cwd, sessionId, t]);
+  }, [cwd, sessionId, t, beginRequest, isCurrentRequest]);
 
   const installPlugin = useCallback(async () => {
     const source = normalizePluginSourceInput(installSource).trim();
     if (!source) return;
+    const generation = beginRequest();
     setInstallSource(source);
     const key = `${installScope}\0${source}`;
     setBusyKey(`install:${key}`);
@@ -901,6 +952,7 @@ export function PluginsConfig({
         body: JSON.stringify({ action: "install", source, scope: installScope, cwd }),
       });
       const next = (await res.json()) as PluginsResponse & { error?: string };
+      if (!isCurrentRequest(generation)) return;
       if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
       setData(next);
       const installed = findInstalledPackage(next.packages, source, installScope);
@@ -909,11 +961,11 @@ export function PluginsConfig({
       setInstallSource("");
       setActionMessage(t("i18n.packageInstalled"));
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      if (isCurrentRequest(generation)) setActionError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusyKey(null);
+      if (isCurrentRequest(generation)) setBusyKey(null);
     }
-  }, [cwd, installScope, installSource, t]);
+  }, [cwd, installScope, installSource, t, beginRequest, isCurrentRequest]);
 
   const reloadSession = useCallback(async () => {
     if (!sessionId) return;
@@ -923,15 +975,16 @@ export function PluginsConfig({
     setGroupStatus(null);
     try {
       await sendAgentCommand(sessionId, { type: "reload" });
+      if (!requestScope.active) return;
       onReloaded?.();
       await loadPlugins();
-      setActionMessage(t("i18n.sessionReloaded"));
+      if (requestScope.active) setActionMessage(t("i18n.sessionReloaded"));
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      if (requestScope.active) setActionError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusyKey(null);
+      if (requestScope.active) setBusyKey(null);
     }
-  }, [loadPlugins, onReloaded, sessionId, t]);
+  }, [loadPlugins, onReloaded, sessionId, t, requestScope]);
 
   const addBusy = busyKey?.startsWith("install:") ?? false;
   const availableUpdateCount = Object.values(updateStatuses).filter(

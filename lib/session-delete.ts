@@ -26,6 +26,7 @@ import {
   resolveSessionPath,
 } from "./session-reader";
 import { sessionPathKey } from "./session-path";
+import { usageAncestorPaths, type UsageLineageHeader } from "./usage-lineage";
 import { forgetSessionUiState } from "./session-ui-state";
 import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
 import type { SessionEntry } from "./types";
@@ -68,10 +69,13 @@ export async function deleteSessions(
 
   // Read only the bounded headers before deleting.
   const parentPathByKey = new Map<string, string | undefined>();
+  const usageHeadersByKey = new Map<string, UsageLineageHeader | null>();
   for (const filePath of targets.values()) {
     let parentSessionPath: string | undefined;
     try {
-      parentSessionPath = readSessionHeader(filePath)?.parentSession;
+      const header = readSessionHeader(filePath);
+      parentSessionPath = header?.parentSession;
+      usageHeadersByKey.set(sessionPathKey(filePath), header);
     } catch (error) {
       // Empty runtime sessions have a cached path before their first disk write.
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -165,6 +169,27 @@ export async function deleteSessions(
     }
     return undefined;
   };
+  // 删除前收集完整计费祖先，包括活着的祖先以及以往删除留下的来源路径。
+  // 目标头部预先缓存，确保同批或连续删除不会因重写顺序丢失原始关系。
+  const collectUsageAncestors = (childPath: string, header: UsageLineageHeader): string[] => {
+    const paths = new Map<string, string>();
+    const childKey = sessionPathKey(childPath);
+    const pending = usageAncestorPaths(header, childPath);
+    while (pending.length > 0) {
+      const path = pending.pop()!;
+      const key = sessionPathKey(path);
+      if (key === childKey || paths.has(key)) continue;
+      paths.set(key, path);
+      if (!usageHeadersByKey.has(key)) {
+        let ancestor: UsageLineageHeader | null = null;
+        try { ancestor = readSessionHeader(path); } catch { /* 已删除或不可读的祖先仍保留路径身份。 */ }
+        usageHeadersByKey.set(key, ancestor);
+      }
+      const ancestor = usageHeadersByKey.get(key);
+      if (ancestor) pending.push(...usageAncestorPaths(ancestor, path));
+    }
+    return [...paths.values()];
+  };
   if (deletedPaths.size > 0) {
     const scanDirs = new Set([...deletedPaths.values()].map((path) => dirname(path)));
     for (const dir of scanDirs) {
@@ -189,9 +214,10 @@ export async function deleteSessions(
               }
             }
             const lines = readFileSync(childPath, "utf8").split("\n");
-            const header = JSON.parse(lines[0]) as { type?: string; parentSession?: string };
+            const header = JSON.parse(lines[0]) as UsageLineageHeader & { type?: string; parentSession?: string };
             if (header.type !== "session") continue;
-            // Rewrite header with new parentSession
+            // 原始计费来源持久保留；parentSession 继续按侧栏需要指向存活祖先。
+            header.piWebUsageAncestorPaths = collectUsageAncestors(childPath, header);
             header.parentSession = parentSessionPath;
             lines[0] = JSON.stringify(header);
             if (parentSessionPath && parentSessionId) {

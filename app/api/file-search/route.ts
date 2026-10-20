@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getFileListing } from "@/lib/file-listing";
 import { searchFileContents } from "@/lib/file-content-search";
 import { resolveProjectDirectory } from "@/lib/project-directory";
+import { getAllowedFileRoots } from "@/lib/file-access";
 
 const MAX_QUERY_LENGTH = 200;
 
@@ -19,7 +20,10 @@ export async function GET(request: NextRequest) {
     if (!query) return NextResponse.json({ matches: [], truncated: false });
 
     const { files, hardTruncated } = await getFileListing(directory);
-    const result = searchFileContents(directory, files, query, { signal: request.signal });
+    const result = searchFileContents(directory, files, query, {
+      signal: request.signal,
+      allowedRoots: await getAllowedFileRoots(),
+    });
 
     return NextResponse.json({
       matches: result.matches,

@@ -906,6 +906,8 @@ export interface PluginsResponse {
   tokens?: Record<string, PluginTokenUsage>;
   /** 还有插件在后台测，稍后再取一次。 */
   tokensPending?: boolean;
+  /** 当前测量批次，资源或缓存有效期改变时重置前端等待预算。 */
+  tokenBatch?: string;
 }
 
 /** One package of a bulk enable/disable; `error` means it was left as it was. */
@@ -945,6 +947,8 @@ export interface UsageBucketRow extends UsageTotals {
 }
 
 export interface UsageSnapshot {
+  /** 划分所有日期桶时使用的 IANA 时区。 */
+  timeZone: string;
   buckets: UsageBucketRow[];
   files: number;
   generatedAt: number;

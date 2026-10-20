@@ -408,6 +408,7 @@ async function readPlugins(cwd: string): Promise<PluginsResponse> {
  */
 async function withPluginTokens(cwd: string, pending: Promise<PluginsResponse>): Promise<PluginsResponse> {
   const plugins = await pending;
+  const settingsManager = SettingsManager.create(cwd, getAgentDir(), { projectTrusted: plugins.projectResourcesLoaded });
   const snapshot = getPluginTokenSnapshot(
     cwd,
     plugins.packages.map((pkg) => ({
@@ -415,9 +416,14 @@ async function withPluginTokens(cwd: string, pending: Promise<PluginsResponse>):
       scope: pkg.scope,
       installedPath: pkg.installedPath,
       version: pkg.version,
+      // 只把 SDK 已解析且启用的资源交给探针，不能重新扫描包入口。
+      extensions: pkg.disabled ? [] : pkg.resources.filter((resource) => resource.kind === "extension").map((resource) => resource.path),
+      skillPaths: pkg.disabled ? [] : pkg.resources.filter((resource) => resource.kind === "skill").map((resource) => resource.path),
     })),
+    settingsManager.getDefaultTools(),
+    settingsManager.getSettings(),
   );
-  return { ...plugins, tokens: snapshot.tokens, tokensPending: snapshot.pending };
+  return { ...plugins, tokens: snapshot.tokens, tokensPending: snapshot.pending, tokenBatch: snapshot.batch };
 }
 
 function readScope(scope: unknown): PluginScope {

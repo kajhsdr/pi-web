@@ -20,7 +20,7 @@ import {
   isVideoPath,
 } from "@/lib/file-types";
 import { encodeFilePathForApi, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
-import { writeFileContent } from "@/lib/file-write";
+import { useFileEditor } from "@/hooks/useFileEditor";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { parseFrontmatter } from "@/lib/frontmatter";
 import { isExternalMarkdownHref, markdownAppUrlTransform, markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
@@ -36,6 +36,7 @@ import { useI18n } from "@/hooks/useI18n";
 import {
   resolveInitialFileDisplayMode,
   type FileViewerDisplayMode as DisplayMode,
+  type FileViewerContent,
   type FileViewerState,
 } from "@/lib/file-viewer-state";
 
@@ -58,15 +59,7 @@ interface Props {
   watchEnabled?: boolean;
 }
 
-interface FileData {
-  content: string;
-  language: string;
-  size: number;
-  nextOffset: number;
-  truncated: boolean;
-  /** The read's baseline for a save; absent from a server that cannot write. */
-  mtimeMs?: number;
-}
+type FileData = FileViewerContent;
 
 // The editor and its grammars load on the first edit, keeping a read-only viewer
 // as light as it was.
@@ -1174,6 +1167,7 @@ export function FileViewer({
   }
   return (
     <TextFileViewer
+      key={`${filePath}:${sourceSessionId ?? ""}`}
       filePath={filePath}
       cwd={cwd}
       sourceSessionId={sourceSessionId}
@@ -1204,17 +1198,18 @@ function TextFileViewer({
 }: Props) {
   const { isDark } = useTheme();
   const { t } = useI18n();
-  const [data, setData] = useState<FileData | null>(null);
+  const [restoredState] = useState(initialState);
+  const [data, setData] = useState<FileData | null>(restoredState?.editing?.baseline ?? null);
   const [gitDiff, setGitDiff] = useState<GitFileDiffResponse | null>(null);
   const [gitDiffLoading, setGitDiffLoading] = useState(false);
   const [gitDiffResolved, setGitDiffResolved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const requestedInitialDisplayMode = resolveInitialFileDisplayMode(initialState, initialDisplayMode);
-  const initialWrapLines = initialState?.wrapLines ?? false;
-  const initialScrollTop = initialState?.scrollTop ?? 0;
-  const initialScrollLeft = initialState?.scrollLeft ?? 0;
+  const requestedInitialDisplayMode = resolveInitialFileDisplayMode(restoredState, initialDisplayMode);
+  const initialWrapLines = restoredState?.wrapLines ?? false;
+  const initialScrollTop = restoredState?.scrollTop ?? 0;
+  const initialScrollLeft = restoredState?.scrollLeft ?? 0;
   const [displayMode, setDisplayMode] = useState<DisplayMode>(requestedInitialDisplayMode);
   const [wrapLines, setWrapLines] = useState(initialWrapLines);
   const [watching, setWatching] = useState(false);
@@ -1232,24 +1227,30 @@ function TextFileViewer({
     wrapLines: initialWrapLines,
     scrollTop: initialScrollTop,
     scrollLeft: initialScrollLeft,
+    editing: restoredState?.editing,
   });
   const onStateChangeRef = useRef(onStateChange);
   const [selectedLineRange, setSelectedLineRange] = useState<SelectedLineRange | null>(null);
   // Whole file for an HTML preview whose source view is still chunked.
   const [htmlFull, setHtmlFull] = useState<{ text?: string; error?: string } | null>(null);
 
-  // Editing. `draft` non-null opens the editor, which owns the text from then
-  // on; `draftRef` mirrors it so a save reads the latest without re-rendering
-  // the viewer on every keystroke.
-  const [draft, setDraft] = useState<string | null>(null);
-  const [editorKey, setEditorKey] = useState(0);
-  const [dirty, setDirty] = useState(false);
-  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "conflict" | "error">("idle");
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const draftRef = useRef("");
-  const savedDraftRef = useRef("");
   const dataRef = useRef<FileData | null>(null);
   dataRef.current = data;
+  const invalidateReads = useCallback(() => { contentRequestRef.current += 1; }, []);
+  const editor = useFileEditor({
+    filePath,
+    sourceSessionId,
+    initialDraft: restoredState?.editing,
+    invalidateReads,
+    onDraftChange: (editing) => {
+      viewerStateRef.current.editing = editing;
+      onStateChangeRef.current?.({ ...viewerStateRef.current });
+    },
+  });
+  const {
+    draft, dirty, saveState, saveError, editorKey, handleDraftChange, saveDraft,
+    editing, startEditing: beginEditing, stopEditing, replaceFromDisk,
+  } = editor;
 
   onStateChangeRef.current = onStateChange;
 
@@ -1272,6 +1273,7 @@ function TextFileViewer({
       wrapLines: initialWrapLines,
       scrollTop: initialScrollTop,
       scrollLeft: initialScrollLeft,
+      editing: restoredState?.editing,
     };
 
     viewerStateRef.current = nextState;
@@ -1290,6 +1292,7 @@ function TextFileViewer({
     initialWrapLines,
     initialScrollTop,
     initialScrollLeft,
+    restoredState,
   ]);
 
   const fetchContent = useCallback((filePath: string, offset = 0) => {
@@ -1343,98 +1346,53 @@ function TextFileViewer({
 
   const startEditing = useCallback(() => {
     const current = dataRef.current;
-    if (!current || current.truncated || current.mtimeMs === undefined) return;
-    draftRef.current = current.content;
-    savedDraftRef.current = current.content;
-    setDirty(false);
-    setDraft(current.content);
-    setSaveState("idle");
-    setSaveError(null);
-    setEditorKey((key) => key + 1);
-  }, []);
-
-  const stopEditing = useCallback(() => {
-    setDraft(null);
-    setDirty(false);
-    setSaveState("idle");
-    setSaveError(null);
-  }, []);
+    if (current) beginEditing(current);
+  }, [beginEditing]);
 
   const cancelEditing = useCallback(() => {
-    if (draftRef.current !== savedDraftRef.current && !window.confirm(t("files.discardChanges"))) return;
+    if (editing?.saveState === "saving") return;
+    if (editing && editing.content !== editing.baseline.content && !window.confirm(t("files.discardChanges"))) return;
+    if (editing) setData(editing.baseline);
     stopEditing();
-  }, [stopEditing, t]);
+  }, [editing, stopEditing, t]);
 
-  const handleDraftChange = useCallback((next: string) => {
-    draftRef.current = next;
-    const nextDirty = next !== savedDraftRef.current;
-    // Only a change of state re-renders: the editor keeps its own document.
-    setDirty((current) => current === nextDirty ? current : nextDirty);
-  }, []);
-
-  const saveDraft = useCallback(() => {
-    const current = dataRef.current;
-    if (!current || current.mtimeMs === undefined) return;
-    const content = draftRef.current;
-    setSaveState("saving");
-    setSaveError(null);
-    void writeFileContent({
-      filePath,
-      content,
-      expectedMtimeMs: current.mtimeMs,
-      sessionId: sourceSessionId,
-    }).then((result) => {
-      if (result.ok) {
-        savedDraftRef.current = content;
-        setDirty(false);
-        setSaveState("saved");
-        setData((prev) => (prev ? { ...prev, content, size: result.size, mtimeMs: result.mtimeMs } : prev));
-        return;
-      }
-      setSaveState(result.reason === "conflict" ? "conflict" : "error");
-      setSaveError(result.error);
-    });
-  }, [filePath, sourceSessionId]);
-
-  // A save refused because the file changed on disk: take what is there now.
+  // 只有明确重新加载，才允许读取结果替换编辑基线。
   const reloadFromDisk = useCallback(async () => {
+    if (editing?.saveState === "saving") return;
+    if (editing && editing.content !== editing.baseline.content && !window.confirm(t("files.discardChanges"))) return;
+    const contentBeforeRead = editing?.content;
     const loaded = await fetchContent(filePath);
     if (!loaded) return;
-    draftRef.current = loaded.content;
-    savedDraftRef.current = loaded.content;
-    setDraft(loaded.content);
-    setDirty(false);
-    setSaveState("idle");
-    setSaveError(null);
-    setEditorKey((key) => key + 1);
-  }, [fetchContent, filePath]);
+    if (editing?.content !== contentBeforeRead && !window.confirm(t("files.discardChanges"))) return;
+    replaceFromDisk(loaded);
+  }, [editing, replaceFromDisk, fetchContent, filePath, t]);
 
   const canEdit = Boolean(data && !data.truncated && data.mtimeMs !== undefined);
 
-  // Reset and load the file itself when its identity changes. Live watching is
-  // managed separately so pausing it never clears the displayed content.
+  // 恢复草稿和普通读取共用卸载清理，防止旧实例的读取结果修改共享草稿。
+  // 实时监听单独管理，暂停监听不会清空已显示的内容。
   useEffect(() => {
     let active = true;
-    setLoading(true);
-    setError(null);
-    setData(null);
-    setGitDiff(null);
-    setGitDiffResolved(false);
-    setWatching(false);
-    // A different file never inherits the previous one's edits.
-    setDraft(null);
-    setDirty(false);
-    setSaveState("idle");
-    setSaveError(null);
-
-    fetchContent(filePath).finally(() => {
-      if (active) setLoading(false);
-    });
+    if (restoredState?.editing) {
+      setData(restoredState.editing.baseline);
+      setLoading(false);
+    } else {
+      setLoading(true);
+      setError(null);
+      setData(null);
+      setGitDiff(null);
+      setGitDiffResolved(false);
+      setWatching(false);
+      fetchContent(filePath).finally(() => {
+        if (active) setLoading(false);
+      });
+    }
 
     return () => {
       active = false;
+      contentRequestRef.current += 1;
     };
-  }, [filePath, fetchContent, sourceSessionId]);
+  }, [filePath, fetchContent, sourceSessionId, restoredState]);
 
   useEffect(() => {
     setWatching(false);
@@ -1449,6 +1407,7 @@ function TextFileViewer({
     if (!watchEnabled || draft !== null) return;
 
     const synchronize = () => {
+      if (viewerStateRef.current.editing) return;
       void fetchContent(filePath);
       void fetchGitDiff(filePath);
     };
@@ -1947,7 +1906,7 @@ function TextFileViewer({
               >
                 {t("files.save")}
               </button>
-              <button type="button" className="file-viewer-mode-button" onClick={cancelEditing}>
+              <button type="button" className="file-viewer-mode-button" onClick={cancelEditing} disabled={saveState === "saving"}>
                 {t("files.cancelEdit")}
               </button>
             </div>

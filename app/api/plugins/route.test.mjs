@@ -20,6 +20,12 @@ const { GET, POST } = await jiti.import("./route.ts");
 allowFileRoot(cwd);
 
 after(async () => {
+  // 列表的后台探针以项目为 cwd；Windows 必须等子进程退出后才能删除夹具。
+  const deadline = Date.now() + 30_000;
+  while (globalThis.__piPluginTokenCacheV5?.running.size || globalThis.__piPluginTokenCacheV5?.queued.size) {
+    assert.ok(Date.now() < deadline, "background probes did not finish");
+    await new Promise((done) => setTimeout(done, 50));
+  }
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   await rm(root, { recursive: true, force: true });

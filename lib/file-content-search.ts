@@ -1,5 +1,6 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { hasParentDirectorySegment, isPathWithinRoots, resolveRealRoots } from "./path-security";
 
 const MAX_FILES = 4000;
 const MAX_FILE_BYTES = 512 * 1024;
@@ -24,6 +25,8 @@ export interface FileContentSearchOptions {
   maxResults?: number;
   timeBudgetMs?: number;
   signal?: AbortSignal;
+  /** 搜索中的链接目标也必须位于这组已授权根内。 */
+  allowedRoots?: Set<string>;
 }
 
 export interface FileContentSearchResponse {
@@ -73,6 +76,7 @@ export function searchFileContents(
   const maxResults = options.maxResults ?? MAX_RESULTS;
   const deadline = Date.now() + (options.timeBudgetMs ?? TIME_BUDGET_MS);
   const signal = options.signal;
+  const realRoots = resolveRealRoots(options.allowedRoots ?? new Set([root]));
   // Literal search: every operator escaped, so offsets stay in the real line.
   const matcher = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
 
@@ -89,9 +93,12 @@ export function searchFileContents(
 
     let buffer: Buffer;
     try {
-      const stat = statSync(join(root, relative));
+      if (hasParentDirectorySegment(relative)) continue;
+      const realFile = realpathSync(join(root, relative));
+      if (!isPathWithinRoots(realFile, realRoots)) continue;
+      const stat = statSync(realFile);
       if (!stat.isFile() || stat.size === 0 || stat.size > maxFileBytes) continue;
-      buffer = readFileSync(join(root, relative));
+      buffer = readFileSync(realFile);
     } catch {
       continue;
     }

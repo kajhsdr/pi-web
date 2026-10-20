@@ -1,13 +1,20 @@
 import { NextResponse } from "next/server";
 import { getUsageSnapshot } from "@/lib/usage-analytics";
+import { usageDateFormatter } from "@/lib/usage-calendar";
 
 export const dynamic = "force-dynamic";
 
-// GET /api/usage — 跨会话的花费与 token 汇总。
-// 首次要读几百个 session 文件，之后按文件指纹增量，30 秒内复用同一份结果。
-export async function GET() {
+// GET /api/usage?timeZone=Asia/Shanghai — 按浏览器的 IANA 时区划分日期。
+// 未传 timeZone 时使用固定的 UTC 默认值，兼容现有 API 调用方。
+export async function GET(request: Request) {
+  const timeZone = new URL(request.url).searchParams.get("timeZone") ?? "UTC";
   try {
-    return NextResponse.json(await getUsageSnapshot());
+    usageDateFormatter(timeZone);
+  } catch {
+    return NextResponse.json({ error: "Invalid IANA time zone" }, { status: 400 });
+  }
+  try {
+    return NextResponse.json(await getUsageSnapshot(undefined, timeZone));
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

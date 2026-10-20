@@ -733,7 +733,7 @@ export function SettingsPanel({
           {/* No project needed: the global mcp.json is listed alone, and a project adds its group. */}
           {sectionHost("mcp", <McpConfig embedded key={cwd ?? ""} cwd={cwd} trust={projectTrust} onTrustProject={onOpenTrustDialog} onProjectTrustChanged={onProjectTrustChanged} onClose={onClose} />)}
           {/* 费用：全局统计，不需要项目 */}
-          {sectionHost("usage", <UsageConfig embedded onClose={onClose} />)}
+          {sectionHost("usage", <UsageConfig embedded visible={section === "usage"} onClose={onClose} />)}
         </main>
       </div>
     </div>

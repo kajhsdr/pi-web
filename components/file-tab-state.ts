@@ -85,6 +85,7 @@ export function openFileTab(tabs: Tab[], input: OpenFileTabInput): Tab[] {
         wrapLines: tab.viewerState?.wrapLines ?? false,
         scrollTop: 0,
         scrollLeft: 0,
+        ...(tab.viewerState?.editing ? { editing: tab.viewerState.editing } : {}),
       };
       bumpRevision = true;
     }

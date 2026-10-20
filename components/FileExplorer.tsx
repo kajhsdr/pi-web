@@ -763,15 +763,14 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   const [uploadSummary, setUploadSummary] = useState<UploadSummary | null>(null);
   const [pendingConflict, setPendingConflict] = useState<PendingConflict | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchPaths, setSearchPaths] = useState<string[]>([]);
+  const [pathResult, setPathResult] = useState<{ cwd: string; query: string; paths: string[] } | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState(false);
   const [searchExpanded, setSearchExpanded] = useState<Set<string>>(new Set());
   const searchInputRef = useRef<HTMLInputElement>(null);
   // Matches inside files, beside the path matches above.
-  const [contentMatches, setContentMatches] = useState<ContentMatch[]>([]);
+  const [contentResult, setContentResult] = useState<{ cwd: string; query: string; matches: ContentMatch[]; truncated: boolean } | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
-  const [contentTruncated, setContentTruncated] = useState(false);
   const [fileDragActive, setFileDragActive] = useState(false);
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
   const fileDragDepthRef = useRef(0);
@@ -780,14 +779,21 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const refreshToken = `${refreshKey ?? 0}:${treeRefreshKey}`;
   const uploadBusy = uploadPhase !== "idle";
-  const hasSearchQuery = searchQuery.trim().length > 0;
+  const query = searchQuery.trim();
+  const hasSearchQuery = query.length > 0;
+  // 渲染时立即校验归属，确保 effect 和防抖计时器运行前就隐藏过期结果。
+  const searchPaths = useMemo(() => pathResult?.cwd === cwd && pathResult.query === query
+    ? pathResult.paths : [], [cwd, pathResult, query]);
+  const currentContentResult = contentResult?.cwd === cwd && contentResult.query === query ? contentResult : null;
+  const contentMatches = currentContentResult?.matches ?? [];
+  const contentTruncated = currentContentResult?.truncated ?? false;
 
   // Reuse the cached, bounded file index used by @ mentions.
   useEffect(() => {
     if (!fileSearchOpen) return;
     const query = searchQuery.trim();
     if (!query) {
-      setSearchPaths([]);
+      setPathResult(null);
       setSearchLoading(false);
       setSearchError(false);
       return;
@@ -798,10 +804,13 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     const timer = setTimeout(() => {
       fetch(`/api/file-index?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}`, { signal: controller.signal })
         .then((response) => response.ok ? response.json() as Promise<{ matches?: FileIndexEntry[] }> : Promise.reject(new Error("Search failed")))
-        .then((data) => setSearchPaths((data.matches ?? []).filter((entry) => !entry.isDir).map((entry) => entry.path)))
+        .then((data) => {
+          if (controller.signal.aborted) return;
+          setPathResult({ cwd, query, paths: (data.matches ?? []).filter((entry) => !entry.isDir).map((entry) => entry.path) });
+        })
         .catch(() => {
           if (!controller.signal.aborted) {
-            setSearchPaths([]);
+            setPathResult(null);
             setSearchError(true);
           }
         })
@@ -816,9 +825,8 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     if (!fileSearchOpen) return;
     const query = searchQuery.trim();
     if (query.length < 2) {
-      setContentMatches([]);
+      setContentResult(null);
       setContentLoading(false);
-      setContentTruncated(false);
       return;
     }
     const controller = new AbortController();
@@ -829,13 +837,12 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
           ? response.json() as Promise<{ matches?: ContentMatch[]; truncated?: boolean }>
           : Promise.reject(new Error("Search failed")))
         .then((data) => {
-          setContentMatches(data.matches ?? []);
-          setContentTruncated(Boolean(data.truncated));
+          if (controller.signal.aborted) return;
+          setContentResult({ cwd, query, matches: data.matches ?? [], truncated: Boolean(data.truncated) });
         })
         .catch(() => {
           if (!controller.signal.aborted) {
-            setContentMatches([]);
-            setContentTruncated(false);
+            setContentResult(null);
           }
         })
         .finally(() => { if (!controller.signal.aborted) setContentLoading(false); });
@@ -1356,7 +1363,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
               <button
                 key={`${match.path}:${match.line}:${index}`}
                 type="button"
-                onClick={() => onOpenFile(joinFilePath(cwd, match.path), getFileName(match.path))}
+                onClick={() => onOpenFile(joinFilePath(currentContentResult!.cwd, match.path), getFileName(match.path))}
                 title={`${match.path}:${match.line}`}
                 style={{
                   display: "block",
