@@ -9,7 +9,7 @@ export interface AgentEventStreamSession {
   readonly isStreaming: boolean;
   readonly streamingMessage: unknown;
   isAlive?(): boolean;
-  onEvent(listener: (event: AgentEventLike) => void): () => void;
+  onEvent(listener: (event: AgentEventLike) => void, options?: { replayNextSteps?: boolean }): () => void;
 }
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -250,7 +250,7 @@ export function createAgentEventStream(
             forwardEvent(event, snapshot);
           };
 
-          const stopListening = session.onEvent(handleEvent);
+          const stopListening = session.onEvent(handleEvent, { replayNextSteps: true });
           if (closed) {
             stopListening();
             return;

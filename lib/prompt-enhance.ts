@@ -56,12 +56,7 @@ function textOf(message: AssistantMessage): string {
     .trim();
 }
 
-/**
- * One standalone request: the note the user typed, no tools, no session prefix.
- * `runtime` is the shared extension-loaded runtime the settings and provider
- * routes use, so this works for a chat that has no wrapper yet (a fresh
- * session), where there is no session model to borrow.
- */
+/** 独立优化请求：只使用传入 runtime，不读取或写入会话消息。 */
 export async function enhancePrompt(
   runtime: ModelRuntime,
   model: Model<Api>,
@@ -84,8 +79,8 @@ export async function enhancePrompt(
   const thinkingLevel = resolveTitleThinkingLevel(model);
 
   try {
-    // `completeSimple`, not `complete`: it is the path that honours `reasoning`
-    // and routes a virtual model through the extension that registered it.
+    if (controller.signal.aborted) throw new Error("Prompt enhancement timed out");
+    // completeSimple 支持 reasoning，并通过扩展调用虚拟模型。
     const message = await runtime.completeSimple(model, context, {
       maxTokens: ENHANCE_MAX_TOKENS,
       cacheRetention: "none",
@@ -93,6 +88,8 @@ export async function enhancePrompt(
       signal: controller.signal,
       ...(thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
     });
+    // provider 即使忽略 signal 返回结果，取消后也不能覆盖草稿。
+    if (controller.signal.aborted) throw new Error("Prompt enhancement timed out");
     const text = parseEnhancedPrompt(textOf(message));
     if (!text) throw new Error("The model returned an empty prompt");
     return text;

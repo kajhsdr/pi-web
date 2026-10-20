@@ -92,7 +92,7 @@ function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnab
   const [nextStepsModel, setNextStepsModel] = useState("");
   const [nextStepsSaving, setNextStepsSaving] = useState(false);
   const [nextStepsError, setNextStepsError] = useState<string | null>(null);
-  const [nextStepsModels, setNextStepsModels] = useState<{ provider: string; id: string; name: string }[]>([]);
+  const [generationModels, setGenerationModels] = useState<{ provider: string; id: string; name: string }[]>([]);
   const [pushRegistering, setPushRegistering] = useState(false);
   const [pushStatus, setPushStatus] = useState<{ kind: "ok" | "error"; message: string } | null>(null);
   const [webAuthEnabled, setWebAuthEnabled] = useState(false);
@@ -186,14 +186,14 @@ function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnab
     return () => { cancelled = true; };
   }, []);
 
-  // The suggestion model is chosen from the same list the model picker uses.
+  // 两个辅助功能共用当前项目的模型列表。
   useEffect(() => {
     if (!cwd) return;
     let cancelled = false;
     void fetch(`/api/models?cwd=${encodeURIComponent(cwd)}`)
       .then((response) => response.ok ? response.json() : null)
       .then((data: { modelList?: { provider: string; id: string; name: string }[] } | null) => {
-        if (!cancelled) setNextStepsModels(data?.modelList ?? []);
+        if (!cancelled) setGenerationModels(data?.modelList ?? []);
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -436,10 +436,9 @@ function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnab
         {cacheMissNoticesError && <p role="alert" className="settings-general-error">{cacheMissNoticesError}</p>}
       </section>
 
-      {/* Next-step suggestions (#1341). Off by default: each enabled reply spends
-          one extra model request, so the switch comes with the model that spends it. */}
+      {/* 两项辅助功能共用模型，自动建议单独开关。 */}
       <section className="settings-general-section">
-        <h3 className="settings-general-heading">{t("settings.nextSteps")}</h3>
+        <h3 className="settings-general-heading">{t("settings.assistFeatures")}</h3>
         <div className="settings-chat-options">
           <div className="settings-chat-option settings-chat-switch-option">
             <span>{t("settings.nextSteps")}</span>
@@ -452,14 +451,16 @@ function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnab
             />
           </div>
           <div className="settings-chat-option settings-chat-switch-option">
-            <label htmlFor="settings-next-steps-model">{t("settings.nextStepsModel")}</label>
+            <label htmlFor="settings-next-steps-model">{t("settings.assistModel")}</label>
             <select
               id="settings-next-steps-model"
               value={nextStepsModel}
-              disabled={nextStepsSaving}
+              disabled={nextStepsEnabled === null || nextStepsSaving}
+              aria-describedby="settings-next-steps-description"
               onChange={(event) => void patchNextSteps({ model: event.target.value })}
               style={{
                 maxWidth: 280,
+                minWidth: 0,
                 padding: "5px 8px",
                 border: "1px solid var(--border)",
                 borderRadius: 6,
@@ -469,7 +470,10 @@ function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnab
               }}
             >
               <option value="">{t("settings.nextStepsModelFollow")}</option>
-              {nextStepsModels.map((model) => (
+              {nextStepsModel && !generationModels.some((model) => `${model.provider}/${model.id}` === nextStepsModel) && (
+                <option value={nextStepsModel}>{nextStepsModel}</option>
+              )}
+              {generationModels.map((model) => (
                 <option key={`${model.provider}/${model.id}`} value={`${model.provider}/${model.id}`}>
                   {model.name} · {model.provider}
                 </option>
@@ -477,7 +481,7 @@ function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnab
             </select>
           </div>
         </div>
-        <p id="settings-next-steps-description" className="settings-general-description">{t("settings.nextStepsDescription")}</p>
+        <p id="settings-next-steps-description" className="settings-general-description">{t("settings.assistDescription")}</p>
         {nextStepsError && <p role="alert" className="settings-general-error">{nextStepsError}</p>}
       </section>
 

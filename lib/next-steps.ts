@@ -75,7 +75,7 @@ export function parseNextSteps(raw: string): string[] {
       return [];
     }
   }
-  if (items.length === 0) {
+  if (start < 0) {
     for (const line of raw.replace(/```/g, "").split(/\r?\n/)) {
       const step = cleanStep(line);
       if (step) items.push(step);
@@ -153,7 +153,10 @@ export async function generateNextSteps(
     }],
   };
 
+  if (signal?.aborted) return [];
   const apiKey = await agent.getApiKey?.(model.provider);
+  // 凭据读取期间也可能取消，取消后不再发起付费请求。
+  if (signal?.aborted) return [];
   const controller = new AbortController();
   const abort = () => controller.abort();
   if (signal?.aborted) controller.abort();

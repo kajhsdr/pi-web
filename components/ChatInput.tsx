@@ -96,6 +96,8 @@ interface Props {
   onSoundToggle?: () => void;
   onAudioUnlock?: () => void;
   draftKey?: string;
+  /** 初始化会话扩展，不发送消息，让优化请求复用当前项目的模型。 */
+  onEnsureSession?: () => Promise<string | null>;
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
   /** Files picked with the attach button, handled like files dropped onto the chat. Without it the button takes images only. */
@@ -660,6 +662,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   soundEnabled, onSoundToggle, onAudioUnlock,
   onPromptWithStreamingBehavior,
   draftKey,
+  onEnsureSession,
   cwd,
   onAttachFiles,
   compact = false,
@@ -695,8 +698,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   // what is typed, and no send on its own.
   const [enhancing, setEnhancing] = useState(false);
   const [enhanceError, setEnhanceError] = useState<string | null>(null);
-  /** The text an enhancement replaced, kept so it can be put back. */
-  const [enhanceUndo, setEnhanceUndo] = useState<string | null>(null);
+  /** 保存替换前后的文本，撤销不得覆盖后续编辑。 */
+  const [enhanceUndo, setEnhanceUndo] = useState<{ before: string; after: string; context: string } | null>(null);
+  const enhanceContextKey = [draftKey, cwd, model?.provider, model?.modelId].join("\0");
+  const enhanceRequestRef = useRef<{ controller: AbortController; snapshot: string; context: string } | null>(null);
+  const canUndoEnhance = enhanceUndo !== null && value === enhanceUndo.after && enhanceContextKey === enhanceUndo.context;
   const [fileIndex, setFileIndex] = useState<{ cwd: string; entries: FileIndexEntry[]; truncated: boolean } | null>(null);
   const [fileIndexLoading, setFileIndexLoading] = useState(false);
   const [atServerResult, setAtServerResult] = useState<{ cwd: string; query: string; matches: FileIndexEntry[] } | null>(null);
@@ -731,12 +737,22 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
 
-  // Rewrite what is typed into a precise prompt and put it back in the composer.
-  // It never sends: the result stays editable, and the previous text is still
-  // there for an undo.
+  // 草稿、目录或模型变化后，取消旧请求；卸载时也停止生成。
+  useLayoutEffect(() => {
+    const request = enhanceRequestRef.current;
+    if (!request || (request.snapshot === value && request.context === enhanceContextKey)) return;
+    enhanceRequestRef.current = null;
+    request.controller.abort();
+    setEnhancing(false);
+  }, [value, enhanceContextKey]);
+  useEffect(() => () => {
+    enhanceRequestRef.current?.controller.abort();
+    enhanceRequestRef.current = null;
+  }, []);
+
   const enhanceCurrentPrompt = async () => {
     const note = valueRef.current.trim();
-    if (!note || enhancing) return;
+    if (!note || enhanceRequestRef.current) return;
     if (!model) {
       setEnhanceError(t("chat.enhanceNoModel"));
       return;
@@ -744,24 +760,31 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     // The text this request is about. If the composer no longer holds it when
     // the answer arrives — the user typed on or sent it — the result is stale.
     const snapshot = valueRef.current;
+    const request = { controller: new AbortController(), snapshot, context: enhanceContextKey };
+    enhanceRequestRef.current = request;
     setEnhancing(true);
     setEnhanceError(null);
     setEnhanceUndo(null);
     try {
+      const sessionId = await onEnsureSession?.();
+      request.controller.signal.throwIfAborted();
+      if (onEnsureSession && !sessionId) throw new Error("Unable to initialize the session");
       const response = await fetch("/api/enhance-prompt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: note, provider: model.provider, modelId: model.modelId }),
+        body: JSON.stringify({ text: note, provider: model.provider, modelId: model.modelId, ...(sessionId ? { sessionId } : {}) }),
+        signal: request.controller.signal,
       });
       const data = await response.json() as { text?: string; error?: string };
       if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
       const enhanced = data.text?.trim();
       if (!enhanced) throw new Error(t("chat.enhanceEmpty"));
+      if (enhanceRequestRef.current !== request || request.controller.signal.aborted) return;
       if (valueRef.current !== snapshot) {
         setEnhanceError(t("chat.enhanceDiscarded"));
         return;
       }
-      setEnhanceUndo(snapshot);
+      setEnhanceUndo({ before: snapshot, after: enhanced, context: enhanceContextKey });
       valueRef.current = enhanced;
       setValue(enhanced);
       setAtQuery(null);
@@ -774,17 +797,29 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
       });
     } catch (cause) {
-      setEnhanceError(cause instanceof Error ? cause.message : String(cause));
+      if (enhanceRequestRef.current === request && !request.controller.signal.aborted) {
+        setEnhanceError(cause instanceof Error ? cause.message : String(cause));
+      }
     } finally {
-      setEnhancing(false);
+      if (enhanceRequestRef.current === request) {
+        enhanceRequestRef.current = null;
+        setEnhancing(false);
+      }
     }
   };
 
   const undoEnhance = () => {
-    if (enhanceUndo === null) return;
-    valueRef.current = enhanceUndo;
-    setValue(enhanceUndo);
+    if (!enhanceUndo || valueRef.current !== enhanceUndo.after || enhanceContextKey !== enhanceUndo.context) return;
+    valueRef.current = enhanceUndo.before;
+    setValue(enhanceUndo.before);
     setEnhanceUndo(null);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.style.height = "auto";
+      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+    });
   };
 
   useImperativeHandle(ref, () => ({
@@ -1902,7 +1937,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             {compactResultText}
           </div>
         )}
-        {enhanceUndo !== null && !enhanceError && (
+        {canUndoEnhance && !enhanceError && (
           <div
             role="status"
             style={{

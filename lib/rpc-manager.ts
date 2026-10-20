@@ -22,7 +22,7 @@ import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { generateNextSteps, parseModelKey } from "./next-steps";
-import { readNextStepsSettings } from "./next-steps-settings";
+import { getNextStepsSettingsVersion, readNextStepsSettings, subscribeNextStepsSettings } from "./next-steps-settings";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type {
   ExtensionUiRequest,
@@ -327,8 +327,10 @@ export class AgentSessionWrapper {
   // that discards a generation the user has already moved past.
   private nextSteps: string[] = [];
   private nextStepsGeneration = 0;
+  private nextStepsPending = false;
   /** The suggestion request in flight, so shutting down does not wait out its timeout. */
   private nextStepsAbort: AbortController | null = null;
+  private unsubscribeNextStepsSettings: (() => void) | null = null;
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
@@ -441,8 +443,11 @@ export class AgentSessionWrapper {
   }
 
   start(): void {
+    this.unsubscribeNextStepsSettings?.();
+    this.unsubscribeNextStepsSettings = subscribeNextStepsSettings(() => this.clearNextSteps());
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
       if (event.type === "agent_start") {
+        this.clearNextSteps();
         this.agentRunNeedsCompletion = true;
         this.lastRunAborted = false;
       }
@@ -476,27 +481,48 @@ export class AgentSessionWrapper {
    * off, because each attempt spends a real model request.
    */
   private scheduleNextSteps(): void {
+    this.nextStepsPending = true;
+    // settled 可能早于发送命令和 prompt 的结算，先等本轮计数归零。
+    queueMicrotask(() => this.flushNextSteps());
+  }
+
+  private flushNextSteps(): void {
+    if (!this.nextStepsPending || this.isRunning() || this.activeMutatingCommands > 0) return;
+    this.nextStepsPending = false;
     void this.runNextSteps();
   }
 
   private async runNextSteps(): Promise<void> {
-    const generation = ++this.nextStepsGeneration;
-    if (this.listeners.size === 0) return;
+    this.cancelNextSteps();
+    if (!this.isAlive() || this.listeners.size === 0 || this.lastRunAborted) return;
+    const source = this.inner as unknown as AgentSession;
+    const generation = this.nextStepsGeneration;
+    const settingsVersion = getNextStepsSettingsVersion();
+    const sessionId = this.sessionId;
+    const leafId = this.inner.sessionManager.getLeafId?.();
+    const model = source.agent.state.model;
+    const messages = [...(source.agent.state.messages ?? [])];
+    // 设置读取和模型调用都跨异步边界；仅允许同一空闲上下文继续请求或发布。
+    const isCurrent = () => generation === this.nextStepsGeneration
+      && settingsVersion === getNextStepsSettingsVersion()
+      && this.isAlive() && !this.isRunning() && this.activeMutatingCommands === 0
+      && !this.lastRunAborted && this.listeners.size > 0
+      && sessionId === this.sessionId && leafId === this.inner.sessionManager.getLeafId?.()
+      && model === source.agent.state.model
+      && messages.length === (source.agent.state.messages?.length ?? 0)
+      && messages.every((message, index) => message === source.agent.state.messages[index]);
+    if (!isCurrent()) return;
     const settings = await readNextStepsSettings().catch(() => null);
-    if (!settings?.enabled) return;
-    if (this.lastRunAborted) return;
-    if (!this._alive || this.closing || this.inner.isStreaming || this.inner.isBashRunning) return;
+    if (!settings?.enabled || !isCurrent()) return;
     const controller = new AbortController();
     this.nextStepsAbort = controller;
     try {
       const steps = await generateNextSteps(
-        this.inner as unknown as AgentSession,
+        source,
         parseModelKey(settings.model),
         controller.signal,
       );
-      // A prompt arrived meanwhile: those chips would describe a finished task.
-      if (generation !== this.nextStepsGeneration) return;
-      if (!this._alive || this.closing || this.listeners.size === 0) return;
+      if (!isCurrent() || controller.signal.aborted) return;
       this.setNextSteps(steps);
     } catch {
       // Silent: a suggestion nobody asked for is not worth a notice.
@@ -511,11 +537,16 @@ export class AgentSessionWrapper {
     this.emit({ type: "next_steps", steps });
   }
 
-  /** Drop the chips for the session and cancel any generation still in flight. */
-  private clearNextSteps(): void {
+  private cancelNextSteps(): void {
+    this.nextStepsPending = false;
     this.nextStepsGeneration++;
     this.nextStepsAbort?.abort();
     this.nextStepsAbort = null;
+  }
+
+  /** Drop the chips for the session and cancel any generation still in flight. */
+  private clearNextSteps(): void {
+    this.cancelNextSteps();
     if (this.nextSteps.length === 0) return;
     this.setNextSteps([]);
   }
@@ -728,6 +759,7 @@ export class AgentSessionWrapper {
     targetId: string,
     options: { summarize?: boolean },
   ): Promise<{ cancelled: boolean }> {
+    this.clearNextSteps();
     const activeBefore = this.inner.getActiveToolNames();
     const result = await this.inner.navigateTree(targetId, options);
     if (result.cancelled || this.chatOnly) return { cancelled: result.cancelled };
@@ -818,12 +850,15 @@ export class AgentSessionWrapper {
     cacheSessionPath(this.inner.sessionId, sessionFile);
   }
 
-  onEvent(listener: EventListener): () => void {
+  onEvent(listener: EventListener, options?: { replayNextSteps?: boolean }): () => void {
     this.listeners.add(listener);
     for (const event of this.pendingUiRequests.values()) listener(event);
     for (const event of this.activeToolEvents.values()) listener(event);
+    // 重连可能漏掉清空事件，必须重放空快照以移除旧按钮。
+    if (options?.replayNextSteps) listener({ type: "next_steps", steps: this.nextSteps });
     return () => {
       this.listeners.delete(listener);
+      if (this.listeners.size === 0) this.cancelNextSteps();
     };
   }
 
@@ -956,6 +991,7 @@ export class AgentSessionWrapper {
             this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
             this.resetIdleTimer();
             this.notifyAgentRunCompleteIfIdle();
+            this.flushNextSteps();
           };
 
           this.pendingPromptCount += 1;
@@ -1441,6 +1477,7 @@ export class AgentSessionWrapper {
       }
     } finally {
       if (tracksMutation) this.activeMutatingCommands = Math.max(0, this.activeMutatingCommands - 1);
+      this.flushNextSteps();
     }
   }
 
@@ -1465,6 +1502,8 @@ export class AgentSessionWrapper {
     // A suggestion still streaming would keep using this session's model
     // runtime for up to its timeout; the wrapper is gone either way.
     this.clearNextSteps();
+    this.unsubscribeNextStepsSettings?.();
+    this.unsubscribeNextStepsSettings = null;
     this.disposeMcpHost();
     // Tell attached SSE listeners to drop this instance so the browser
     // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
@@ -1519,6 +1558,7 @@ export class AgentSessionWrapper {
     // Closing starts before the first await, so a request that arrives while
     // extensions shut down starts a fresh wrapper instead of prompting this one.
     this.closing = true;
+    this.clearNextSteps();
 
     this.shutdownPromise = (async () => {
       try {

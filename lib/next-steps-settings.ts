@@ -14,7 +14,7 @@ import { serializeByKey } from "./key-serializer";
 export interface NextStepsSettings {
   /** Off by default: every run that turns this on spends one extra request. */
   enabled: boolean;
-  /** "provider/modelId"; empty means the session's own model. */
+  /** 两项辅助功能共用的 provider/modelId；空值跟随会话模型，enabled 仅控制自动建议。 */
   model?: string;
 }
 
@@ -25,6 +25,29 @@ export interface NextStepsSettingsPatch {
 
 const DEFAULTS: NextStepsSettings = { enabled: false };
 const WRITE_QUEUE_KEY: symbol = Symbol.for("pi-web:next-steps-settings");
+const CHANGES_KEY: symbol = Symbol.for("pi-web:next-steps-settings-changes");
+
+type SettingsChanges = { version: number; listeners: Set<() => void> };
+
+function settingsChanges(): SettingsChanges {
+  // 路由与旧 wrapper 可能来自不同的热更新模块，版本和订阅必须共用进程状态。
+  const store = globalThis as Record<symbol, Map<string, SettingsChanges> | undefined>;
+  const changes = (store[CHANGES_KEY] ??= new Map());
+  const path = getNextStepsSettingsPath();
+  let state = changes.get(path);
+  if (!state) changes.set(path, state = { version: 0, listeners: new Set() });
+  return state;
+}
+
+export function getNextStepsSettingsVersion(): number {
+  return settingsChanges().version;
+}
+
+export function subscribeNextStepsSettings(listener: () => void): () => void {
+  const state = settingsChanges();
+  state.listeners.add(listener);
+  return () => { state.listeners.delete(listener); };
+}
 
 export function getNextStepsSettingsPath(agentDir = getAgentDir()): string {
   return join(agentDir, "pi-web-next-steps.json");
@@ -83,6 +106,17 @@ export async function updateNextStepsSettings(
     });
     mkdirSync(dirname(path), { recursive: true });
     writePrivateFileAtomicSync(path, `${JSON.stringify(next, null, 2)}\n`);
+    if (next.enabled !== current.enabled || next.model !== current.model) {
+      const state = settingsChanges();
+      state.version++;
+      for (const listener of state.listeners) {
+        try {
+          listener();
+        } catch (error) {
+          console.warn("[pi-web] next-step settings listener failed:", error);
+        }
+      }
+    }
     return next;
   });
 }
