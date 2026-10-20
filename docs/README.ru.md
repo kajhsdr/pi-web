@@ -118,7 +118,6 @@ npm run dev
 Сервер разработки доступен по адресу [http://127.0.0.1:30141](http://127.0.0.1:30141). Основные проверки запускаются командами:
 
 ```bash
-npm test
 node_modules/.bin/tsc --noEmit
 npm run lint
 ```

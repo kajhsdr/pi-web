@@ -123,7 +123,6 @@ npm run dev
 开发服务器运行在 [http://127.0.0.1:30141](http://127.0.0.1:30141)。常用检查命令：
 
 ```bash
-npm test
 node_modules/.bin/tsc --noEmit
 npm run lint
 ```

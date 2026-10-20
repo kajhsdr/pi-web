@@ -54,11 +54,3 @@ installation directory (for npx, the cache directory containing `node_modules`).
 On Debian/Ubuntu, install `python3` and `build-essential` first. This forces a
 source build instead of reusing a missing or incompatible prebuilt binary.
 Restart Pi Web after repair.
-
-## Verification
-
-Run `npm test` for native PTY, lease, output cursor, input queue, and storage
-checks. `npm run test:terminal` starts an isolated development server and runs
-desktop/mobile browser checks using generated session fixtures. Install the
-Playwright Chromium browser first with `npx playwright install chromium`.
-The browser check prints the temporary location of its screenshots and log.

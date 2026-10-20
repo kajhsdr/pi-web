@@ -176,7 +176,6 @@ npm run dev
 The development server runs at [http://127.0.0.1:30141](http://127.0.0.1:30141). Run the common checks with:
 
 ```bash
-npm test
 node_modules/.bin/tsc --noEmit
 npm run lint
 ```
