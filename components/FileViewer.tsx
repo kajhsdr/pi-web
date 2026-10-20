@@ -23,14 +23,14 @@ import { encodeFilePathForApi, getFileDirectory, getFileName, getRelativeFilePat
 import { useFileEditor } from "@/hooks/useFileEditor";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { parseFrontmatter } from "@/lib/frontmatter";
-import { isExternalMarkdownHref, markdownAppUrlTransform, markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
+import { isExternalMarkdownHref, jumpToMarkdownFragment, markdownAppUrlTransform, markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
 import { CodeBlock, MermaidBlock } from "./MermaidBlock";
 import { DelimitedTable } from "./DelimitedTable";
 import { isDelimitedTablePath } from "@/lib/delimited-table";
 import { isJsonlPath } from "@/lib/jsonl-records";
 import { JsonlRecords } from "./JsonlRecords";
 import { FrontmatterCard } from "./FrontmatterCard";
-import { diffGapLabel, parseUnifiedPatch } from "@/lib/patch";
+import { diffGapLabel, parseUnifiedPatch, unifiedDiffLines, type SplitDiffGap, type UnifiedDiffLine } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
 import { useI18n } from "@/hooks/useI18n";
 import {
@@ -288,15 +288,11 @@ function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceS
   );
 }
 
-type DiffLine = {
-  type: "unchanged" | "removed" | "added";
-  text: string;
-  oldLineNo: number | null;
-  newLineNo: number | null;
-};
+// The same rows the tool card's split diff parses, in one column; see `unifiedDiffLines()`.
+type DiffLine = UnifiedDiffLine;
 
 // Unchanged lines the patch leaves out between two hunks.
-type DiffGap = { type: "gap"; count: number | null };
+type DiffGap = SplitDiffGap;
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -307,38 +303,7 @@ function formatSize(bytes: number): string {
 function diffLines(patch: string): Array<DiffLine | DiffGap> {
   const files = parseUnifiedPatch(patch);
   if (!files) return [];
-
-  return files.flatMap((file) => file.rows.flatMap((row): Array<DiffLine | DiffGap> => {
-    if (row.type === "hunk") return [];
-    if (row.type === "gap") return [row];
-    if (row.left.type === "context" && row.right.type === "context") {
-      return [{
-        type: "unchanged",
-        text: row.right.text,
-        oldLineNo: row.left.lineNo,
-        newLineNo: row.right.lineNo,
-      }];
-    }
-
-    const lines: DiffLine[] = [];
-    if (row.left.type === "removed") {
-      lines.push({
-        type: "removed",
-        text: row.left.text,
-        oldLineNo: row.left.lineNo,
-        newLineNo: null,
-      });
-    }
-    if (row.right.type === "added") {
-      lines.push({
-        type: "added",
-        text: row.right.text,
-        oldLineNo: null,
-        newLineNo: row.right.lineNo,
-      });
-    }
-    return lines;
-  }));
+  return files.flatMap(unifiedDiffLines);
 }
 
 function DiffView({ patch }: { patch: string }) {
@@ -1987,7 +1952,7 @@ function TextFileViewer({
                     // Like chat links: a web or app link must not replace Pi Web.
                     return isExternalMarkdownHref(href)
                       ? <a href={href} {...props} target="_blank" rel="noopener noreferrer">{children}</a>
-                      : <a href={href} {...props}>{children}</a>;
+                      : <a href={href} {...props} onClick={jumpToMarkdownFragment}>{children}</a>;
                   }
 
                   const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
