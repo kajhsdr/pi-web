@@ -105,6 +105,8 @@ type AgentStateResponse = {
   autoCompactionEnabled?: boolean;
   extensionStatuses?: ExtensionStatusItem[];
   extensionWidgets?: ExtensionWidgetItem[];
+  /** Next-step chips of the last settled run (#1341); empty when there are none. */
+  nextSteps?: string[];
   queuedMessages?: { steering?: string[]; followUp?: string[] } | null;
 };
 
@@ -408,6 +410,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionCustomUis, setExtensionCustomUis] = useState<ExtensionUiCustomRequest[]>([]);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
+  const [nextSteps, setNextSteps] = useState<string[]>([]);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
 
   const eventConnectionRef = useRef<AgentEventConnection | null>(null);
@@ -775,6 +778,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt ?? null);
           if (liveState.extensionStatuses !== undefined) setExtensionStatuses(liveState.extensionStatuses ?? []);
           if (liveState.extensionWidgets !== undefined) setExtensionWidgets(liveState.extensionWidgets ?? []);
+          if (liveState.nextSteps !== undefined) setNextSteps(liveState.nextSteps ?? []);
           if (liveState.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(liveState.queuedMessages));
           if (liveState.autoCompactionEnabled !== undefined) setAutoCompactionEnabled(liveState.autoCompactionEnabled ?? true);
         } else if (!agentState.running) {
@@ -1390,6 +1394,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (state) {
         if (state.extensionStatuses !== undefined) setExtensionStatuses(state.extensionStatuses ?? []);
         if (state.extensionWidgets !== undefined) setExtensionWidgets(state.extensionWidgets ?? []);
+        if (state.nextSteps !== undefined) setNextSteps(state.nextSteps ?? []);
         // The poll leaves the prompt out: read the one the run ended with once, as agent_end does.
         fetch(`/api/agent/${encodeURIComponent(sid)}`)
           .then((r) => r.ok ? r.json() : null)
@@ -1435,6 +1440,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
+      case "next_steps": {
+        // Sent by our own wrapper (lib/rpc-manager.ts) when a settled run
+        // produced suggestions, and again as [] when a new prompt retires them.
+        const steps = Array.isArray(event.steps) ? event.steps : [];
+        setNextSteps(steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0));
+        break;
+      }
       case "connected": {
         dispatch({ type: "end" });
         if (Array.isArray(event.pendingExtensionUiIds)) {
@@ -1489,6 +1501,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
               if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
               if (d.state?.extensionWidgets !== undefined) setExtensionWidgets(d.state.extensionWidgets ?? []);
+              if (d.state?.nextSteps !== undefined) setNextSteps(d.state.nextSteps ?? []);
               // Aborted turns can leave messages queued in pi (delivered with the
               // next turn); dead wrapper (no state) means the queue is gone.
               setQueuedMessages(normalizeQueuedMessages(d.state?.queuedMessages));
@@ -2442,6 +2455,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       clearSlashCommands();
       setExtensionStatuses([]);
       setExtensionWidgets([]);
+      setNextSteps([]);
       const [state] = await Promise.all([
         sendAgentCommand<AgentStateResponse>(activeSessionId, { type: "get_state" }),
         loadTools(activeSessionId),
@@ -2587,6 +2601,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (agentState.state.systemPrompt !== undefined) setSystemPrompt(agentState.state.systemPrompt ?? null);
           if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
           if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
+          if (agentState.state.nextSteps !== undefined) setNextSteps(agentState.state.nextSteps ?? []);
           if (agentState.state.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(agentState.state.queuedMessages));
         }
       });
@@ -2779,6 +2794,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices: noticeState.visible, extensionDialog, waitingExtensionDialogCount, extensionCustomUi, waitingExtensionCustomUiCount, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
+    nextSteps,
     isAutoModelSelection: isNew && newSessionModel === null,
     isAutoThinkingSelection: isNew && newSessionThinkingLevel === null,
     defaultModel: newSessionDefaultModel,

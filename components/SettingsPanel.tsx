@@ -75,7 +75,7 @@ export function SettingsSectionIcon({ section, size = 16, strokeWidth = 1.8 }: {
   return <svg {...common}><path d="M9 7V2M15 7V2M6 13V8a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v5a6 6 0 0 1-12 0ZM12 19v3" /></svg>;
 }
 
-function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, onQuoteSelectionChange }: Pick<Props, "sessionId" | "onSessionReloaded" | "quoteSelectionEnabled" | "onQuoteSelectionChange">) {
+function GeneralSettings({ sessionId, cwd, onSessionReloaded, quoteSelectionEnabled, onQuoteSelectionChange }: Pick<Props, "sessionId" | "cwd" | "onSessionReloaded" | "quoteSelectionEnabled" | "onQuoteSelectionChange">) {
   const { locale, setLocale, supportedLocales, t } = useI18n();
   const { preference, setThemePreference } = useTheme();
   const { width: chatContentWidth, setWidth: setChatContentWidth, fontSize, setFontSize } = useChatAppearance();
@@ -88,6 +88,11 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
   const [cacheMissNotices, setCacheMissNotices] = useState<boolean | null>(null);
   const [cacheMissNoticesSaving, setCacheMissNoticesSaving] = useState(false);
   const [cacheMissNoticesError, setCacheMissNoticesError] = useState<string | null>(null);
+  const [nextStepsEnabled, setNextStepsEnabled] = useState<boolean | null>(null);
+  const [nextStepsModel, setNextStepsModel] = useState("");
+  const [nextStepsSaving, setNextStepsSaving] = useState(false);
+  const [nextStepsError, setNextStepsError] = useState<string | null>(null);
+  const [nextStepsModels, setNextStepsModels] = useState<{ provider: string; id: string; name: string }[]>([]);
   const [pushRegistering, setPushRegistering] = useState(false);
   const [pushStatus, setPushStatus] = useState<{ kind: "ok" | "error"; message: string } | null>(null);
   const [webAuthEnabled, setWebAuthEnabled] = useState(false);
@@ -162,6 +167,55 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
       setCacheMissNoticesError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setCacheMissNoticesSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/next-steps")
+      .then(async (response) => {
+        const data = await response.json() as { enabled?: boolean; model?: string; error?: string };
+        if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+        if (cancelled) return;
+        setNextStepsEnabled(data.enabled === true);
+        setNextStepsModel(data.model ?? "");
+      })
+      .catch((cause) => {
+        if (!cancelled) setNextStepsError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // The suggestion model is chosen from the same list the model picker uses.
+  useEffect(() => {
+    if (!cwd) return;
+    let cancelled = false;
+    void fetch(`/api/models?cwd=${encodeURIComponent(cwd)}`)
+      .then((response) => response.ok ? response.json() : null)
+      .then((data: { modelList?: { provider: string; id: string; name: string }[] } | null) => {
+        if (!cancelled) setNextStepsModels(data?.modelList ?? []);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [cwd]);
+
+  const patchNextSteps = async (patch: { enabled?: boolean; model?: string }) => {
+    setNextStepsSaving(true);
+    setNextStepsError(null);
+    try {
+      const response = await fetch("/api/next-steps", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      const data = await response.json() as { enabled?: boolean; model?: string; error?: string };
+      if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+      setNextStepsEnabled(data.enabled === true);
+      setNextStepsModel(data.model ?? "");
+    } catch (cause) {
+      setNextStepsError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setNextStepsSaving(false);
     }
   };
 
@@ -380,6 +434,51 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
         </div>
         <p id="settings-cache-miss-notices-description" className="settings-general-description">{t("settings.cacheMissNoticesDescription")}</p>
         {cacheMissNoticesError && <p role="alert" className="settings-general-error">{cacheMissNoticesError}</p>}
+      </section>
+
+      {/* Next-step suggestions (#1341). Off by default: each enabled reply spends
+          one extra model request, so the switch comes with the model that spends it. */}
+      <section className="settings-general-section">
+        <h3 className="settings-general-heading">{t("settings.nextSteps")}</h3>
+        <div className="settings-chat-options">
+          <div className="settings-chat-option settings-chat-switch-option">
+            <span>{t("settings.nextSteps")}</span>
+            <ConfigSwitch
+              checked={nextStepsEnabled === true}
+              loading={(nextStepsEnabled === null && !nextStepsError) || nextStepsSaving}
+              label={t("settings.nextSteps")}
+              describedBy="settings-next-steps-description"
+              onChange={(enabled) => void patchNextSteps({ enabled })}
+            />
+          </div>
+          <div className="settings-chat-option settings-chat-switch-option">
+            <label htmlFor="settings-next-steps-model">{t("settings.nextStepsModel")}</label>
+            <select
+              id="settings-next-steps-model"
+              value={nextStepsModel}
+              disabled={nextStepsSaving}
+              onChange={(event) => void patchNextSteps({ model: event.target.value })}
+              style={{
+                maxWidth: 280,
+                padding: "5px 8px",
+                border: "1px solid var(--border)",
+                borderRadius: 6,
+                background: "var(--bg)",
+                color: "var(--text)",
+                font: "inherit",
+              }}
+            >
+              <option value="">{t("settings.nextStepsModelFollow")}</option>
+              {nextStepsModels.map((model) => (
+                <option key={`${model.provider}/${model.id}`} value={`${model.provider}/${model.id}`}>
+                  {model.name} · {model.provider}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <p id="settings-next-steps-description" className="settings-general-description">{t("settings.nextStepsDescription")}</p>
+        {nextStepsError && <p role="alert" className="settings-general-error">{nextStepsError}</p>}
       </section>
 
       <section className="settings-general-section">
@@ -620,7 +719,7 @@ export function SettingsPanel({
         </div>
 
         <main className="settings-dialog-main">
-          {sectionHost("general", <GeneralSettings sessionId={sessionId} onSessionReloaded={onSessionReloaded} quoteSelectionEnabled={quoteSelectionEnabled} onQuoteSelectionChange={onQuoteSelectionChange} />)}
+          {sectionHost("general", <GeneralSettings cwd={cwd} sessionId={sessionId} onSessionReloaded={onSessionReloaded} quoteSelectionEnabled={quoteSelectionEnabled} onQuoteSelectionChange={onQuoteSelectionChange} />)}
           {sectionHost("models", <ModelsConfig embedded cwd={cwd} onClose={onClose} />)}
           {/* Visited sections stay mounted, so the ones whose answer depends on trust take the page's
               status and load again in place when trusting from Settings › MCP changes it. */}

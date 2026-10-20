@@ -691,6 +691,12 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const [historyActiveIndex, setHistoryActiveIndex] = useState(0);
   const [builtinCommandPending, setBuiltinCommandPending] = useState(false);
   const builtinCommandPendingRef = useRef(false);
+  // The composer's "improve prompt" button (#1312): one request that rewrites
+  // what is typed, and no send on its own.
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceError, setEnhanceError] = useState<string | null>(null);
+  /** The text an enhancement replaced, kept so it can be put back. */
+  const [enhanceUndo, setEnhanceUndo] = useState<string | null>(null);
   const [fileIndex, setFileIndex] = useState<{ cwd: string; entries: FileIndexEntry[]; truncated: boolean } | null>(null);
   const [fileIndexLoading, setFileIndexLoading] = useState(false);
   const [atServerResult, setAtServerResult] = useState<{ cwd: string; query: string; matches: FileIndexEntry[] } | null>(null);
@@ -724,6 +730,62 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const pendingImageCountRef = useRef(0);
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
+
+  // Rewrite what is typed into a precise prompt and put it back in the composer.
+  // It never sends: the result stays editable, and the previous text is still
+  // there for an undo.
+  const enhanceCurrentPrompt = async () => {
+    const note = valueRef.current.trim();
+    if (!note || enhancing) return;
+    if (!model) {
+      setEnhanceError(t("chat.enhanceNoModel"));
+      return;
+    }
+    // The text this request is about. If the composer no longer holds it when
+    // the answer arrives — the user typed on or sent it — the result is stale.
+    const snapshot = valueRef.current;
+    setEnhancing(true);
+    setEnhanceError(null);
+    setEnhanceUndo(null);
+    try {
+      const response = await fetch("/api/enhance-prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: note, provider: model.provider, modelId: model.modelId }),
+      });
+      const data = await response.json() as { text?: string; error?: string };
+      if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+      const enhanced = data.text?.trim();
+      if (!enhanced) throw new Error(t("chat.enhanceEmpty"));
+      if (valueRef.current !== snapshot) {
+        setEnhanceError(t("chat.enhanceDiscarded"));
+        return;
+      }
+      setEnhanceUndo(snapshot);
+      valueRef.current = enhanced;
+      setValue(enhanced);
+      setAtQuery(null);
+      requestAnimationFrame(() => {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        ta.focus();
+        ta.setSelectionRange(enhanced.length, enhanced.length);
+        ta.style.height = "auto";
+        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      });
+    } catch (cause) {
+      setEnhanceError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setEnhancing(false);
+    }
+  };
+
+  const undoEnhance = () => {
+    if (enhanceUndo === null) return;
+    valueRef.current = enhanceUndo;
+    setValue(enhanceUndo);
+    setEnhanceUndo(null);
+  };
 
   useImperativeHandle(ref, () => ({
     insertIfEmpty(text: string) {
@@ -877,8 +939,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
       });
     },
-    insertText(text: string) {
-      const ta = textareaRef.current;
+    insertText(text: string) {      const ta = textareaRef.current;
       if (!ta) {
         setValue((v) => v + (v ? " " : "") + text);
         return;
@@ -956,6 +1017,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     setValue("");
     setAtQuery(null);
     setHistoryMenuOpen(false);
+    setEnhanceUndo(null);
+    setEnhanceError(null);
     if (draftKey) clearDraft(draftKey);
     if (draftKeyRef.current && draftKeyRef.current !== draftKey) clearDraft(draftKeyRef.current);
     clearImages();
@@ -1839,6 +1902,63 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             {compactResultText}
           </div>
         )}
+        {enhanceUndo !== null && !enhanceError && (
+          <div
+            role="status"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              marginBottom: 8,
+              padding: "2px 10px",
+              color: "var(--text-muted)",
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            <span>{t("chat.enhanceApplied")}</span>
+            <button
+              type="button"
+              onClick={undoEnhance}
+              style={{
+                padding: 0,
+                border: "none",
+                background: "none",
+                color: "var(--accent)",
+                font: "inherit",
+                cursor: "pointer",
+                textDecoration: "underline",
+              }}
+            >
+              {t("chat.enhanceUndo")}
+            </button>
+            <DismissButton onClick={() => setEnhanceUndo(null)} title={t("i18n.close")} />
+          </div>
+        )}
+        {enhanceError && (
+          <div
+            role="alert"
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 6,
+              marginBottom: 8,
+              padding: "3px 3px 3px 10px",
+              background: "rgba(239,68,68,0.07)",
+              border: "1px solid rgba(239,68,68,0.3)",
+              borderRadius: 6,
+              color: "#ef4444",
+              fontFamily: "var(--font-mono)",
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            <span style={{ minWidth: 0, flex: 1, padding: "4px 0", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+              {t("chat.enhanceFailed", { message: enhanceError })}
+            </span>
+            <DismissButton onClick={() => setEnhanceError(null)} title={t("i18n.close")} />
+          </div>
+        )}
         {compactError && (
           <div
             role="alert"
@@ -2530,6 +2650,51 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 backdropFilter: "blur(10px)",
               } : null),
             }}>
+            {!compact && (
+              <button
+                type="button"
+                onClick={() => void enhanceCurrentPrompt()}
+                disabled={enhancing || !value.trim()}
+                title={t("chat.enhancePrompt")}
+                aria-label={t("chat.enhancePrompt")}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
+                  padding: isMobile ? "0 6px" : "8px 12px",
+                  width: isMobile ? "auto" : undefined,
+                  height: 32,
+                  background: "none",
+                  border: "none",
+                  borderRadius: 9,
+                  color: "var(--text-muted)",
+                  cursor: enhancing || !value.trim() ? "default" : "pointer",
+                  fontSize: 12,
+                  opacity: enhancing || !value.trim() ? 0.5 : 1,
+                  transition: "background 0.12s, color 0.12s, opacity 0.12s",
+                }}
+                onMouseEnter={(e) => {
+                  if (enhancing || !value.trim()) return;
+                  e.currentTarget.style.background = "var(--bg-hover)";
+                  e.currentTarget.style.color = "var(--text)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "none";
+                  e.currentTarget.style.color = "var(--text-muted)";
+                }}
+              >
+                {enhancing ? (
+                  <span className="enhance-spinner" aria-hidden="true" />
+                ) : (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M11 3.5l1.6 4.3 4.3 1.6-4.3 1.6L11 15.3 9.4 11 5.1 9.4 9.4 7.8z" />
+                    <path d="M18 14.5l.9 2.4 2.4.9-2.4.9-.9 2.4-.9-2.4-2.4-.9 2.4-.9z" />
+                  </svg>
+                )}
+                {(!isMobile || controlsMenuOpen) && (
+                  <span style={{ whiteSpace: "nowrap" }}>{enhancing ? t("chat.enhancing") : t("chat.enhancePrompt")}</span>
+                )}
+              </button>
+            )}
+
             {onThinkingLevelChange && (
               <div ref={thinkingDropdownRef} style={{ position: "relative" }}>
                 <button

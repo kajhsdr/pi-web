@@ -831,6 +831,83 @@ html[data-keyboard-open] .terminal-extra-keys {
   background-color: rgb(var(--terminal-scrollbar));
 }
 
+/* Spinner inside the composer's "improve prompt" button (#1312). */
+.enhance-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: enhance-spin 700ms linear infinite;
+}
+
+@keyframes enhance-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Next-step chips above the composer (#1341). They sit in the same column as
+   the input, and wrap onto more rows rather than scrolling sideways. */
+.next-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 0 8px;
+}
+
+.next-step-chip {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.next-step-chip:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: color-mix(in srgb, var(--text-dim) 60%, var(--border));
+}
+
+.next-step-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.next-step-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.next-step-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.next-step-send {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 
 .extension-status-shelf {
   display: flex;

@@ -19,6 +19,7 @@ import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
+import { NextSteps } from "./NextSteps";
 import { AnsiText } from "./AnsiText";
 import { useI18n } from "@/hooks/useI18n";
 import { phaseLabel } from "@/lib/chat-phase-label";
@@ -283,6 +284,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices, extensionDialog, waitingExtensionDialogCount, extensionCustomUi, waitingExtensionCustomUiCount, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput, setNoticePaused, addNotice,
+    nextSteps,
     isAutoModelSelection,
     isAutoThinkingSelection,
     defaultModel,
@@ -1502,6 +1504,11 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
               </div>
               {newSessionContextBar}
             </div>
+          </div>
+        )}
+        {nextSteps.length > 0 && !isEmptyNew && (
+          <div style={{ maxWidth: "var(--chat-content-max-width, 820px)", margin: "0 auto" }}>
+            <NextSteps steps={nextSteps} onSend={handleSend} disabled={sessionBusy} />
           </div>
         )}
         {chatInputElement}

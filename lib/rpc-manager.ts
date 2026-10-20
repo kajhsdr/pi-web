@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type AgentSession, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -21,6 +21,8 @@ import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trus
 import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import { generateNextSteps, parseModelKey } from "./next-steps";
+import { readNextStepsSettings } from "./next-steps-settings";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type {
   ExtensionUiRequest,
@@ -321,6 +323,12 @@ export class AgentSessionWrapper {
   private agentRunNeedsCompletion = false;
   // Whether the last run ended because it was stopped (pi 1.1's `agent_settled.aborted`), not finished.
   private lastRunAborted = false;
+  // Next-step suggestions (#1341): the chips beside the composer, and a counter
+  // that discards a generation the user has already moved past.
+  private nextSteps: string[] = [];
+  private nextStepsGeneration = 0;
+  /** The suggestion request in flight, so shutting down does not wait out its timeout. */
+  private nextStepsAbort: AbortController | null = null;
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
@@ -438,7 +446,10 @@ export class AgentSessionWrapper {
         this.agentRunNeedsCompletion = true;
         this.lastRunAborted = false;
       }
-      if (event.type === "agent_settled") this.lastRunAborted = event.aborted === true;
+      if (event.type === "agent_settled") {
+        this.lastRunAborted = event.aborted === true;
+        this.scheduleNextSteps();
+      }
       if (event.type === "agent_end") {
         invalidateSessionListCache();
         // Every tool call of the run has finished; nothing is left to replay.
@@ -454,6 +465,59 @@ export class AgentSessionWrapper {
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
     });
     this.resetIdleTimer();
+  }
+
+  /**
+   * Ask for next-step suggestions once a run has settled (#1341).
+   *
+   * Fire-and-forget: the chips are a convenience, so a slow or failed request
+   * only means no chips arrive. Nothing is generated while nobody is watching
+   * (`listeners` empty), after the user stopped the run, or when the setting is
+   * off, because each attempt spends a real model request.
+   */
+  private scheduleNextSteps(): void {
+    void this.runNextSteps();
+  }
+
+  private async runNextSteps(): Promise<void> {
+    const generation = ++this.nextStepsGeneration;
+    if (this.listeners.size === 0) return;
+    const settings = await readNextStepsSettings().catch(() => null);
+    if (!settings?.enabled) return;
+    if (this.lastRunAborted) return;
+    if (!this._alive || this.closing || this.inner.isStreaming || this.inner.isBashRunning) return;
+    const controller = new AbortController();
+    this.nextStepsAbort = controller;
+    try {
+      const steps = await generateNextSteps(
+        this.inner as unknown as AgentSession,
+        parseModelKey(settings.model),
+        controller.signal,
+      );
+      // A prompt arrived meanwhile: those chips would describe a finished task.
+      if (generation !== this.nextStepsGeneration) return;
+      if (!this._alive || this.closing || this.listeners.size === 0) return;
+      this.setNextSteps(steps);
+    } catch {
+      // Silent: a suggestion nobody asked for is not worth a notice.
+    } finally {
+      if (this.nextStepsAbort === controller) this.nextStepsAbort = null;
+    }
+  }
+
+  private setNextSteps(steps: string[]): void {
+    if (isDeepStrictEqual(this.nextSteps, steps)) return;
+    this.nextSteps = steps;
+    this.emit({ type: "next_steps", steps });
+  }
+
+  /** Drop the chips for the session and cancel any generation still in flight. */
+  private clearNextSteps(): void {
+    this.nextStepsGeneration++;
+    this.nextStepsAbort?.abort();
+    this.nextStepsAbort = null;
+    if (this.nextSteps.length === 0) return;
+    this.setNextSteps([]);
   }
 
   /**
@@ -851,6 +915,8 @@ export class AgentSessionWrapper {
         // this submission starts a run or joins its streaming queue.
         const releaseAdmission = await this.acquirePromptAdmission();
         try {
+          // A new message retires the previous run's suggestions.
+          this.clearNextSteps();
           if (this.inner.isBashRunning) {
             throw new Error("Cannot send a prompt while a shell command is running");
           }
@@ -1025,6 +1091,9 @@ export class AgentSessionWrapper {
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
+          // The chips a client that connects now should show: the last settled
+          // run's suggestions, if it produced any.
+          nextSteps: [...this.nextSteps],
         };
       }
 
@@ -1393,6 +1462,9 @@ export class AgentSessionWrapper {
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
+    // A suggestion still streaming would keep using this session's model
+    // runtime for up to its timeout; the wrapper is gone either way.
+    this.clearNextSteps();
     this.disposeMcpHost();
     // Tell attached SSE listeners to drop this instance so the browser
     // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
